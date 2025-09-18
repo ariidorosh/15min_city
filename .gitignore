@@ -1,0 +1,37 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+build/
+dist/
+
+# --- Venvs ---
+.venv/
+venv/
+env/
+
+# --- IDE ---
+.idea/
+*.iml
+
+# --- Логи/артефакти/кеш ---
+logs/
+outputs/
+cache/
+*.log
+*.tmp
+
+# --- Дані ---
+# ігноруємо все в data/, крім "якорів" (залиш демо/порожні папки)
+data/*
+!data/.gitkeep
+# окремо графи, якщо раптом залишиш винятки вище
+data/graphs/
+
+# --- OS-сміття ---
+.DS_Store
+Thumbs.db
+
+# --- Jupyter (на всяк випадок) ---
+.ipynb_checkpoints/
