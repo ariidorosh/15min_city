@@ -1,3 +1,5 @@
+python-qt5
+shapely==2.0.3
 osmnx == 1.6.0
 networkx == 3.2.1
 matplotlib == 3.8.4
@@ -6,6 +8,6 @@ geopandas == 0.14.3
 pandas == 2.2.2
 numpy == 1.26.4
 geopy==2.4.1
-
 PyQt5 == 5.15.10
 PyQtWebEngine == 5.15.6
+pyogrio==0.7.2
