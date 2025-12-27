@@ -1,116 +1,135 @@
+# graph_builder.py
+from __future__ import annotations
+
 import os
-import glob
-import shutil
-import re
-from typing import Optional, Tuple, Dict, List
+from typing import Dict, List, Optional, Tuple
 
+import networkx as nx
 import osmnx as ox
+
+from cache_manager import locate_and_deploy_cached_file_debug
 from logger_config import logger
-
-GRAPH_DIR = os.path.join("data", "graphs")
-os.makedirs(GRAPH_DIR, exist_ok=True)
-
-
-def _safe_name(city_name: str) -> str:
-    return city_name.lower().replace(",", "").replace(" ", "_")
+from osmnx_client import ensure_osmnx_settings
+from paths import DIR_GRAPHS, ensure_data_dirs
+from utils import safe_name
 
 
-def _norm_name(s: str) -> str:
-    s = s.lower()
-    s = re.sub(r"[^a-zа-яіїєґ0-9]+", "_", s)
-    return s.strip("_")
+def _graph_path(city_name: str) -> str:
+    safe = safe_name(city_name)
+    return os.path.join(DIR_GRAPHS, f"{safe}.graphml")
 
 
-def _locate_graph_file_debug(expected_path: str, place: str, required_tokens: Optional[List[str]] = None) -> Tuple[Optional[str], Dict]:
+def load_city_graph_from_cache_debug(
+    city_name: str,
+    *,
+    required_tokens: Optional[List[str]] = None,
+) -> Tuple[Optional[nx.MultiDiGraph], Dict[str, object]]:
+    """
+    Повертає: (G або None, info)
+
+    info ключі (стабільно):
+      - place
+      - source: "cache"
+      - cache_action: "exists" | "copied" | "fallback_read" | "not_found"
+      - expected_path
+      - used_path
+      - candidates
+    """
+    ensure_data_dirs()
+    expected_path = _graph_path(city_name)
+
+    located, cinfo = locate_and_deploy_cached_file_debug(
+        expected_path=expected_path,
+        suffix=".graphml",
+        place=city_name,
+        required_tokens=required_tokens,
+    )
+
+    cache_action = cinfo.get("action") or "not_found"
+    used_path = cinfo.get("used_path") or located
+
     info: Dict[str, object] = {
-        "expected_path": expected_path,
-        "used_path": None,
-        "action": "not_found",
-        "candidates": []
+        "place": city_name,
+        "source": "cache",
+        "cache_action": cache_action,
+        "expected_path": cinfo.get("expected_path", expected_path),
+        "used_path": used_path,
+        "candidates": cinfo.get("candidates", []),
     }
-    if os.path.exists(expected_path):
-        info["used_path"] = expected_path
-        info["action"] = "exists"
-        return expected_path, info
 
-    candidates = glob.glob(os.path.join(GRAPH_DIR, "*.graphml")) + \
-                 glob.glob(os.path.join(os.getcwd(), "*.graphml")) + \
-                 glob.glob("/mnt/data/*.graphml")
-    place_tokens = re.findall(r"[\w\u0400-\u04FF]+", place.lower())
-    required = [t for t in (required_tokens or []) if t]
-
-    scored: List[Tuple[int, str]] = []
-    for p in candidates:
-        fname = _norm_name(os.path.basename(p))
-        score = sum(1 for t in place_tokens if t and t in fname)
-        # --- строгий фільтр: усі required-токени мають бути присутні
-        if required and not all(t in fname for t in required):
-            continue
-        scored.append((score, p))
-
-    scored.sort(key=lambda x: (-x[0], x[1]))
-    info["candidates"] = [p for _, p in scored]
-
-    if not scored or scored[0][0] <= 0:
+    if not used_path or not os.path.exists(used_path):
         return None, info
 
-    best = scored[0][1]
     try:
-        os.makedirs(os.path.dirname(expected_path), exist_ok=True)
-        shutil.copy2(best, expected_path)
-        logger.info("Deployed graph cache %s -> %s", best, expected_path)
-        info["used_path"] = expected_path
-        info["action"] = "copied"
-        return expected_path, info
+        logger.info("Завантаження графа з кешу: %s", used_path)
+        G = ox.load_graphml(used_path)
+        return G, info
     except Exception as e:
-        logger.warning("Failed to copy graph %s -> %s: %s", best, expected_path, e)
-        info["used_path"] = best
-        info["action"] = "fallback_read"
-        return best, info
+        logger.warning("load_graphml failed for %s: %s", used_path, e)
+        # Файл існує, але битий/нечитабельний -> UI потім піде в OSM
+        return None, info
 
 
-def get_city_graph_with_source(city_name: str, network_type: str = "walk", required_tokens: Optional[List[str]] = None):
-    safe = _safe_name(city_name)
-    graph_path = os.path.join(GRAPH_DIR, f"{safe}.graphml")
+def get_city_graph_with_source(
+    city_name: str,
+    *,
+    network_type: str = "walk",
+    required_tokens: Optional[List[str]] = None,
+    force_refresh: bool = False,
+    simplify: bool = True,
+) -> Tuple[nx.MultiDiGraph, Dict[str, object]]:
+    """
+    Повертає (G, info).
 
-    located, info = _locate_graph_file_debug(graph_path, city_name, required_tokens=required_tokens)
-    if located and os.path.exists(located):
-        try:
-            logger.info("Завантаження графа з %s", located)
-            G = ox.load_graphml(located)
-            return G, info
-        except Exception as e:
-            logger.warning("load_graphml failed for %s: %s", located, e)
+    info ключі (основні):
+      - place
+      - source: "cache" | "osm"
+      - cache_action (якщо була спроба кешу)
+      - expected_path
+      - used_path
+      - candidates
+      - saved: bool (чи вдалося записати graphml при source="osm")
+      - force_refresh
+    """
+    ensure_data_dirs()
+    expected = _graph_path(city_name)
 
-    # кеш не спрацював — тягнемо з OSM
-    logger.info("Завантаження мапи міста з OpenStreetMap: %s", city_name)
-    G = ox.graph_from_place(city_name, network_type=network_type, simplify=True)
+    cache_info: Dict[str, object] = {}
+    if not force_refresh:
+        G_cached, cache_info = load_city_graph_from_cache_debug(city_name, required_tokens=required_tokens)
+        if G_cached is not None:
+            return G_cached, cache_info
+
+    ensure_osmnx_settings()
+    logger.info("Завантаження графа з OpenStreetMap: %s (network_type=%s)", city_name, network_type)
+
+    G = ox.graph_from_place(city_name, network_type=network_type, simplify=simplify)
+
+    saved = False
+    used_path: Optional[str] = None
     try:
-        ox.save_graphml(G, graph_path)
-        logger.info("Граф збережено: %s", graph_path)
+        ox.save_graphml(G, expected)
+        saved = True
+        used_path = expected
+        logger.info("Граф збережено: %s", expected)
     except Exception as e:
-        logger.warning("Не вдалося зберегти graphml %s: %s", graph_path, e)
+        logger.warning("Не вдалося зберегти graphml %s: %s", expected, e)
 
-    info.update({"used_path": graph_path, "action": "downloaded"})
+    info: Dict[str, object] = {
+        "place": city_name,
+        "source": "osm",
+        "expected_path": expected,
+        "used_path": used_path,
+        "candidates": cache_info.get("candidates", []),
+        "cache_action": cache_info.get("cache_action") or cache_info.get("action") or "not_found",
+        "saved": saved,
+        "force_refresh": force_refresh,
+    }
+
     return G, info
 
 
-# Сумісна стара функція (без строгих токенів)
-def get_city_graph(city_name: str, network_type: str = "walk"):
-    safe = _safe_name(city_name)
-    graph_path = os.path.join(GRAPH_DIR, f"{safe}.graphml")
-    located = graph_path if os.path.exists(graph_path) else None
-    if located:
-        try:
-            logger.info("Завантаження графа з %s", located)
-            return ox.load_graphml(located)
-        except Exception:
-            pass
-    logger.info("Завантаження мапи міста з OpenStreetMap: %s", city_name)
-    G = ox.graph_from_place(city_name, network_type=network_type, simplify=True)
-    try:
-        ox.save_graphml(G, graph_path)
-        logger.info("Граф збережено: %s", graph_path)
-    except Exception:
-        pass
+def get_city_graph(city_name: str, network_type: str = "walk") -> nx.MultiDiGraph:
+    """Легасі: повертає тільки граф."""
+    G, _ = get_city_graph_with_source(city_name=city_name, network_type=network_type)
     return G
