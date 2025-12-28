@@ -962,7 +962,8 @@ def compute_isochrone(
         raise PathfinderError("cutoff має бути > 0", code="INVALID_CUTOFF", context={"cutoff": cutoff, "weight": weight})
 
     Gwork = G.to_undirected() if use_undirected else G
-    center_node = nearest_node(Gwork, center_latlon)
+    snap_c = snap_to_graph(Gwork, center_latlon, mode="edge")
+    center_node = int(snap_c.chosen_node)
 
     logger.info("Isochrone: center=%s (node=%s), cutoff=%s, weight=%s", center_latlon, center_node, cutoff, weight)
 
