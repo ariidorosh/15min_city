@@ -8,7 +8,15 @@ import networkx as nx
 
 from graph_builder import get_city_graph_with_source
 from poi_extractor import get_poi_with_source, load_boundary_from_cache_debug
-from path_finder import compute_isochrone, find_shortest_path
+from path_finder import (
+    compute_isochrone,
+    find_shortest_path,
+    find_shortest_path_multi,
+    find_shortest_path_via_poi_category,
+    MultiPathResult,
+    PathResult,
+    ViaStopSelection,
+)
 from app_types import Algorithm, LatLon, SourceInfo
 
 
@@ -73,7 +81,8 @@ def build_route(
     algorithm: Algorithm = "dijkstra",
     weight: str = "length",
     use_undirected: bool = True,
-):
+) -> PathResult:
+    """Звичайний маршрут start -> end."""
     return find_shortest_path(
         G,
         start_latlon=start,
@@ -81,6 +90,60 @@ def build_route(
         algorithm=algorithm,
         weight=weight,
         use_undirected=use_undirected,
+        snap_mode="edge",
+    )
+
+
+def build_route_multi(
+    G: nx.MultiDiGraph,
+    *,
+    points: List[LatLon],
+    algorithm: Algorithm = "dijkstra",
+    weight: str = "length",
+    use_undirected: bool = True,
+) -> MultiPathResult:
+    """
+    Маршрут через декілька точок:
+      points = [start, stop1, stop2, ..., end]
+    """
+    return find_shortest_path_multi(
+        G,
+        points=points,
+        algorithm=algorithm,
+        weight=weight,
+        use_undirected=use_undirected,
+        snap_mode="edge",
+    )
+
+
+def build_route_via_category(
+    G: nx.MultiDiGraph,
+    gdf_all_poi,
+    *,
+    start: LatLon,
+    end: LatLon,
+    via_category: str,
+    algorithm: Algorithm = "dijkstra",
+    weight: str = "length",
+    use_undirected: bool = True,
+    prefilter_max: int = 400,
+    max_candidates_to_check: int = 25,
+) -> Tuple[PathResult, ViaStopSelection]:
+    """
+    Авто-маршрут через POI категорії (напр. "amenity=cafe" або "leisure=park" або просто "park").
+    """
+    return find_shortest_path_via_poi_category(
+        G,
+        gdf_all_poi,
+        start,
+        end,
+        via_category=via_category,
+        algorithm=algorithm,
+        weight=weight,
+        use_undirected=use_undirected,
+        snap_mode="edge",
+        prefilter_max=prefilter_max,
+        max_candidates_to_check=max_candidates_to_check,
     )
 
 
@@ -107,7 +170,7 @@ def _normalize_info(info: Dict[str, Any]) -> SourceInfo:
     """Приводить будь-який внутрішній info до єдиного контракту SourceInfo."""
     out: SourceInfo = {}
 
-    # 1) Новий формат (graph_builder/poi_extractor вже так повертають)
+    # 1) Новий формат
     if "place" in info:
         out["place"] = str(info["place"])
     if "source" in info:
@@ -124,7 +187,7 @@ def _normalize_info(info: Dict[str, Any]) -> SourceInfo:
     if out.get("source"):
         return out
 
-    # 2) Легасі fallback: якщо десь ще прилітає "action"
+    # 2) Легасі fallback
     action = info.get("action")
     if action in ("cache", "osm"):
         out["source"] = action  # type: ignore

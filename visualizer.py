@@ -4,14 +4,14 @@ from __future__ import annotations
 import os
 import re
 import time
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import folium
 import osmnx as ox
 from folium.plugins import MarkerCluster
 from shapely.geometry import Point
 
-from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtCore import QThread, pyqtSignal, QFile, QIODevice
 
 from api import load_city_boundary
 from config import LEVELS_QUERIES
@@ -20,6 +20,7 @@ from path_finder import (
     PathfinderError,
     snap_to_graph,
     find_shortest_path,
+    find_shortest_path_multi,
     find_shortest_path_via_poi_category,
 )
 from paths import DIR_OUTPUTS
@@ -42,6 +43,9 @@ LABEL_MAP = {
     "transport": "Громадський транспорт",
 }
 
+# Маркер, щоб не інжектити JS двічі
+_INJECT_MARKER = "injected: qtwebchannel + map_bridge.js"
+
 
 class MapRenderWorker(QThread):
     progress = pyqtSignal(int)
@@ -61,6 +65,7 @@ class MapRenderWorker(QThread):
         route_end_latlon: Optional[LatLon] = None,
         route_algorithm: str = "dijkstra",
         route_via_category: Optional[str] = None,
+        route_stops: Optional[List[LatLon]] = None,
         enable_click_pick: bool = True,
     ):
         super().__init__()
@@ -74,7 +79,8 @@ class MapRenderWorker(QThread):
         self.route_start_latlon = route_start_latlon
         self.route_end_latlon = route_end_latlon
         self.route_algorithm = (route_algorithm or "dijkstra").strip()
-        self.route_via_category = (route_via_category or "none").strip().lower()
+        self.route_via_category = (route_via_category or "none").strip()
+        self.route_stops = list(route_stops or [])
         self.enable_click_pick = bool(enable_click_pick)
 
     # -------------------- helpers: geo/poi --------------------
@@ -198,9 +204,17 @@ class MapRenderWorker(QThread):
         except Exception as e:
             logger.warning("Boundary: не вдалося отримати/намалювати для '%s': %s", self.city_name, e)
 
+    @staticmethod
+    def _fmt_ll(ll: LatLon) -> str:
+        return f"{ll[0]:.6f},{ll[1]:.6f}"
+
     def _add_route_layer(self, m: folium.Map) -> None:
         """
-        Рендер маршруту + дебаг “клік → точка на дорозі”.
+        Рендер маршруту:
+          - simple: start->end
+          - via category (1 stop): start->best_poi->end
+          - multistop: start->stop1->...->end
+        + SNAP debug “клік → точка на дорозі”
         """
         if not (self.route_start_latlon and self.route_end_latlon):
             return
@@ -208,7 +222,7 @@ class MapRenderWorker(QThread):
         fg = folium.FeatureGroup(name="Маршрут", show=True)
         fg.add_to(m)
 
-        # 1) SNAP дебаг (клік → дорога)
+        # 1) SNAP debug (start/end)
         try:
             Gwork = self.G.to_undirected()
 
@@ -217,27 +231,27 @@ class MapRenderWorker(QThread):
 
             self.status.emit(
                 "SNAP START: "
-                f"клік {snap_s.input_latlon[0]:.6f},{snap_s.input_latlon[1]:.6f} → "
-                f"дорога {snap_s.snapped_latlon[0]:.6f},{snap_s.snapped_latlon[1]:.6f} "
+                f"клік {self._fmt_ll(snap_s.input_latlon)} → "
+                f"дорога {self._fmt_ll(snap_s.snapped_latlon)} "
                 f"({snap_s.dist_to_snapped_m:.0f} м)"
             )
             self.status.emit(
                 "SNAP END:   "
-                f"клік {snap_e.input_latlon[0]:.6f},{snap_e.input_latlon[1]:.6f} → "
-                f"дорога {snap_e.snapped_latlon[0]:.6f},{snap_e.snapped_latlon[1]:.6f} "
+                f"клік {self._fmt_ll(snap_e.input_latlon)} → "
+                f"дорога {self._fmt_ll(snap_e.snapped_latlon)} "
                 f"({snap_e.dist_to_snapped_m:.0f} м)"
             )
 
             folium.Marker(
                 location=list(snap_s.input_latlon),
                 tooltip="Старт (клік/будинок)",
-                popup=f"Старт (клік): {snap_s.input_latlon[0]:.6f},{snap_s.input_latlon[1]:.6f}",
+                popup=f"Старт (клік): {self._fmt_ll(snap_s.input_latlon)}",
             ).add_to(fg)
 
             folium.Marker(
                 location=list(snap_e.input_latlon),
                 tooltip="Фініш (клік/будинок)",
-                popup=f"Фініш (клік): {snap_e.input_latlon[0]:.6f},{snap_e.input_latlon[1]:.6f}",
+                popup=f"Фініш (клік): {self._fmt_ll(snap_e.input_latlon)}",
             ).add_to(fg)
 
             folium.CircleMarker(
@@ -247,7 +261,7 @@ class MapRenderWorker(QThread):
                 tooltip="Старт (точка на дорозі)",
                 popup=(
                     "Старт (на дорозі): "
-                    f"{snap_s.snapped_latlon[0]:.6f},{snap_s.snapped_latlon[1]:.6f}<br>"
+                    f"{self._fmt_ll(snap_s.snapped_latlon)}<br>"
                     f"від кліку: ~{snap_s.dist_to_snapped_m:.0f} м<br>"
                     f"edge: {snap_s.edge_u}-{snap_s.edge_v} (key={snap_s.edge_key})"
                 ),
@@ -260,7 +274,7 @@ class MapRenderWorker(QThread):
                 tooltip="Фініш (точка на дорозі)",
                 popup=(
                     "Фініш (на дорозі): "
-                    f"{snap_e.snapped_latlon[0]:.6f},{snap_e.snapped_latlon[1]:.6f}<br>"
+                    f"{self._fmt_ll(snap_e.snapped_latlon)}<br>"
                     f"від кліку: ~{snap_e.dist_to_snapped_m:.0f} м<br>"
                     f"edge: {snap_e.edge_u}-{snap_e.edge_v} (key={snap_e.edge_key})"
                 ),
@@ -287,94 +301,149 @@ class MapRenderWorker(QThread):
             folium.Marker(location=list(self.route_start_latlon), tooltip="Старт").add_to(fg)
             folium.Marker(location=list(self.route_end_latlon), tooltip="Фініш").add_to(fg)
 
+        # 1.1) Stop markers (якщо вони є)
+        if self.route_stops:
+            for i, st in enumerate(self.route_stops, start=1):
+                folium.Marker(
+                    location=[st[0], st[1]],
+                    tooltip=f"Stop #{i}",
+                    popup=f"Stop #{i}: {self._fmt_ll(st)}",
+                    icon=folium.Icon(icon="info-sign"),
+                ).add_to(fg)
+
         # 2) Сам маршрут
-        via = (self.route_via_category or "none").strip().lower()
+        via = (self.route_via_category or "none").strip()
+        has_multistops = bool(self.route_stops)
+
         self.status.emit(
-            f"Маршрут: START {self.route_start_latlon[0]:.6f},{self.route_start_latlon[1]:.6f} "
-            f"→ END {self.route_end_latlon[0]:.6f},{self.route_end_latlon[1]:.6f} | alg={self.route_algorithm} | via={via}"
+            "Маршрут: "
+            f"START {self._fmt_ll(self.route_start_latlon)} "
+            f"→ END {self._fmt_ll(self.route_end_latlon)} "
+            f"| alg={self.route_algorithm} "
+            f"| stops={len(self.route_stops)} "
+            f"| via={via}"
         )
 
         try:
             self.status.emit("Маршрут: обчислення…")
 
-            if via and via != "none":
-                result, sel = find_shortest_path_via_poi_category(
+            result_coords = None
+            result_len_m = 0.0
+            result_start_node = None
+            result_end_node = None
+
+            # Пріоритет: якщо є stop'и — робимо multistop
+            if has_multistops:
+                points = [self.route_start_latlon] + list(self.route_stops) + [self.route_end_latlon]
+                mp = find_shortest_path_multi(
                     self.G,
-                    self.gdf_all_poi,
-                    self.route_start_latlon,
-                    self.route_end_latlon,
-                    via_category=via,
-                    algorithm=self.route_algorithm,
+                    points=points,
+                    algorithm=self.route_algorithm,  # type: ignore
                     weight="length",
                     use_undirected=True,
                     snap_mode="edge",
-                    prefilter_max=400,
-                    max_candidates_to_check=25,
                 )
+                result_coords = mp.coords
+                result_len_m = float(mp.length_m)
 
-                folium.Marker(
-                    location=[sel.poi_latlon[0], sel.poi_latlon[1]],
-                    tooltip=f"Зупинка: {sel.category}",
-                    popup=(
-                        f"<b>Зупинка:</b> {sel.category}<br>"
-                        f"<b>Обрано:</b> {sel.label}<br>"
-                        f"<b>Start→POI:</b> ~{sel.dist_start_to_poi_m:.0f} м<br>"
-                        f"<b>POI→End:</b> ~{sel.dist_poi_to_end_m:.0f} м<br>"
-                        f"<b>Разом:</b> ~{sel.total_m:.0f} м"
-                    ),
-                ).add_to(fg)
+                # для дебагу “вузли”
+                if mp.segments:
+                    result_start_node = mp.segments[0].start_node
+                    result_end_node = mp.segments[-1].end_node
 
+                self.status.emit(f"Маршрут multi-stop: сегментів={len(mp.segments)}, довжина~{result_len_m:.0f} м")
+
+            # Якщо stop'ів нема — тоді або via-category, або звичайний
             else:
-                result = find_shortest_path(
-                    self.G,
-                    self.route_start_latlon,
-                    self.route_end_latlon,
-                    algorithm=self.route_algorithm,
-                    weight="length",
-                    use_undirected=True,
-                    snap_mode="edge",
-                )
+                if via and via.lower() != "none":
+                    r, sel = find_shortest_path_via_poi_category(
+                        self.G,
+                        self.gdf_all_poi,
+                        self.route_start_latlon,
+                        self.route_end_latlon,
+                        via_category=via,
+                        algorithm=self.route_algorithm,  # type: ignore
+                        weight="length",
+                        use_undirected=True,
+                        snap_mode="edge",
+                        prefilter_max=400,
+                        max_candidates_to_check=25,
+                    )
 
-            if getattr(result, "coords", None):
+                    folium.Marker(
+                        location=[sel.poi_latlon[0], sel.poi_latlon[1]],
+                        tooltip=f"Зупинка (POI): {sel.category}",
+                        popup=(
+                            f"<b>Зупинка (POI):</b> {sel.category}<br>"
+                            f"<b>Обрано:</b> {sel.label}<br>"
+                            f"<b>Start→POI:</b> ~{sel.dist_start_to_poi_m:.0f} м<br>"
+                            f"<b>POI→End:</b> ~{sel.dist_poi_to_end_m:.0f} м<br>"
+                            f"<b>Разом:</b> ~{sel.total_m:.0f} м"
+                        ),
+                        icon=folium.Icon(icon="flag"),
+                    ).add_to(fg)
+
+                    result_coords = r.coords
+                    result_len_m = float(r.length_m)
+                    result_start_node = r.start_node
+                    result_end_node = r.end_node
+                else:
+                    r = find_shortest_path(
+                        self.G,
+                        self.route_start_latlon,
+                        self.route_end_latlon,
+                        algorithm=self.route_algorithm,  # type: ignore
+                        weight="length",
+                        use_undirected=True,
+                        snap_mode="edge",
+                    )
+                    result_coords = r.coords
+                    result_len_m = float(r.length_m)
+                    result_start_node = r.start_node
+                    result_end_node = r.end_node
+
+            # Полілінія маршруту
+            if result_coords:
                 folium.PolyLine(
-                    locations=result.coords,
+                    locations=result_coords,
                     weight=5,
                     opacity=0.9,
-                    tooltip=f"Довжина: {getattr(result, 'length_m', 0.0):.0f} м",
+                    tooltip=f"Довжина: {result_len_m:.0f} м",
                 ).add_to(fg)
 
-            # Маркери вузлів графа, які обрав алгоритм
-            try:
-                n1 = int(getattr(result, "start_node", 0))
-                n2 = int(getattr(result, "end_node", 0))
+            # Маркери вузлів графа, які обрав алгоритм (якщо є)
+            if result_start_node is not None and result_end_node is not None:
+                try:
+                    n1 = int(result_start_node)
+                    n2 = int(result_end_node)
 
-                d1 = self.G.nodes[n1]
-                d2 = self.G.nodes[n2]
+                    d1 = self.G.nodes[n1]
+                    d2 = self.G.nodes[n2]
 
-                n1_ll = (float(d1["y"]), float(d1["x"]))
-                n2_ll = (float(d2["y"]), float(d2["x"]))
+                    n1_ll = (float(d1["y"]), float(d1["x"]))
+                    n2_ll = (float(d2["y"]), float(d2["x"]))
 
-                folium.CircleMarker(
-                    location=list(n1_ll),
-                    radius=5,
-                    weight=2,
-                    tooltip=f"Старт (вузол графа {n1})",
-                    popup=f"Старт вузол: {n1}<br>{n1_ll[0]:.6f},{n1_ll[1]:.6f}",
-                ).add_to(fg)
+                    folium.CircleMarker(
+                        location=list(n1_ll),
+                        radius=5,
+                        weight=2,
+                        tooltip=f"Старт (вузол графа {n1})",
+                        popup=f"Старт вузол: {n1}<br>{self._fmt_ll(n1_ll)}",
+                    ).add_to(fg)
 
-                folium.CircleMarker(
-                    location=list(n2_ll),
-                    radius=5,
-                    weight=2,
-                    tooltip=f"Фініш (вузол графа {n2})",
-                    popup=f"Фініш вузол: {n2}<br>{n2_ll[0]:.6f},{n2_ll[1]:.6f}",
-                ).add_to(fg)
+                    folium.CircleMarker(
+                        location=list(n2_ll),
+                        radius=5,
+                        weight=2,
+                        tooltip=f"Фініш (вузол графа {n2})",
+                        popup=f"Фініш вузол: {n2}<br>{self._fmt_ll(n2_ll)}",
+                    ).add_to(fg)
 
-                self.status.emit(f"Маршрут: вузли графа START={n1}, END={n2}")
-            except Exception:
-                pass
+                    self.status.emit(f"Маршрут: вузли графа START={n1}, END={n2}")
+                except Exception:
+                    pass
 
-            self.status.emit(f"Маршрут: готово (довжина ~ {getattr(result, 'length_m', 0.0):.0f} м)")
+            self.status.emit(f"Маршрут: готово (довжина ~ {result_len_m:.0f} м)")
 
         except PathfinderError as e:
             logger.warning("Маршрут не побудовано: %s", e)
@@ -441,7 +510,32 @@ class MapRenderWorker(QThread):
 
     # -------------------- QtWebChannel click-pick injection --------------------
 
+    @staticmethod
+    def _read_qwebchannel_js() -> str:
+        """
+        Надійно читає qwebchannel.js з Qt resources і повертає як текст.
+        Якщо не вдалось — повертає "".
+        """
+        qf = QFile(":/qtwebchannel/qwebchannel.js")
+        if not qf.open(QIODevice.ReadOnly):
+            logger.warning("InjectJS: не можу відкрити :/qtwebchannel/qwebchannel.js")
+            return ""
+        try:
+            return bytes(qf.readAll()).decode("utf-8", errors="ignore")
+        finally:
+            try:
+                qf.close()
+            except Exception:
+                pass
+
     def _inject_click_bridge_js(self, map_file: str) -> None:
+        """
+        Підключає QtWebChannel + map_bridge.js (вмістом)
+        і передає folium-map у window.__folium_map__.
+
+        Важливо:
+        - qwebchannel.js інлайнимо прямо в HTML, щоб не залежати від qrc:/// у file:// режимі.
+        """
         if not self.enable_click_pick:
             return
 
@@ -449,9 +543,11 @@ class MapRenderWorker(QThread):
             with open(map_file, "r", encoding="utf-8") as f:
                 html = f.read()
 
-            if "WebChannel bridge ready" in html and "window.__pick_target" in html:
+            # якщо вже інжектовано — вдруге не ліземо
+            if _INJECT_MARKER in html:
                 return
 
+            # шукаємо змінну folium-карти (map_xxxxx)
             m = re.search(r"var\s+(map_[A-Za-z0-9_]+)\s*=\s*L\.map", html)
             if not m:
                 logger.warning("InjectJS: не знайшов змінну карти у HTML")
@@ -459,71 +555,44 @@ class MapRenderWorker(QThread):
 
             map_var = m.group(1)
 
-            js = f"""
-<!-- injected: qtwebchannel click-pick -->
-<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+            bridge_path = os.path.join(os.path.dirname(__file__), "map_bridge.js")
+            try:
+                with open(bridge_path, "r", encoding="utf-8") as f:
+                    bridge_js = f.read()
+            except Exception as e:
+                logger.error("InjectJS: не вдалося прочитати map_bridge.js (%s): %s", bridge_path, e)
+                return
+
+            qwebchannel_js = self._read_qwebchannel_js()
+            if qwebchannel_js:
+                qwebchannel_tag = f"<script>\n{qwebchannel_js}\n</script>"
+            else:
+                # fallback: якщо ресурс недоступний
+                qwebchannel_tag = '<script src="qrc:///qtwebchannel/qwebchannel.js"></script>'
+
+            inject = f"""
+<!-- {_INJECT_MARKER} -->
+{qwebchannel_tag}
+
 <script>
-(function() {{
-  function initBridge() {{
-    if (typeof qt === 'undefined') {{
-      console.log('qt is undefined (no webchannel?)');
-      return;
-    }}
+  // передаємо folium map у JS
+  window.__folium_map__ = {map_var};
+</script>
 
-    new QWebChannel(qt.webChannelTransport, function(channel) {{
-      window.bridge = channel.objects.bridge;
-      console.log('WebChannel bridge ready');
-    }});
-
-    var map = {map_var};
-    window.__pick_target = window.__pick_target || '';
-
-    function setMarker(kind, lat, lon) {{
-      try {{
-        if (kind === 'start') {{
-          if (window.__startMarker) map.removeLayer(window.__startMarker);
-          window.__startMarker = L.marker([lat, lon]).addTo(map).bindPopup('Start');
-        }} else if (kind === 'end') {{
-          if (window.__endMarker) map.removeLayer(window.__endMarker);
-          window.__endMarker = L.marker([lat, lon]).addTo(map).bindPopup('End');
-        }}
-      }} catch (e) {{
-        console.log('marker error', e);
-      }}
-    }}
-
-    map.on('click', function(e) {{
-      var lat = e.latlng.lat;
-      var lon = e.latlng.lng;
-
-      var tgt = window.__pick_target || '';
-      if (!tgt) return;
-
-      setMarker(tgt, lat, lon);
-
-      if (window.bridge && window.bridge.map_clicked) {{
-        window.bridge.map_clicked(lat, lon);
-      }}
-    }});
-  }}
-
-  if (document.readyState === 'loading') {{
-    document.addEventListener('DOMContentLoaded', initBridge);
-  }} else {{
-    initBridge();
-  }}
-}})();
+<script>
+{bridge_js}
 </script>
 """
+
             if "</body>" in html:
-                html = html.replace("</body>", js + "\n</body>")
+                html = html.replace("</body>", inject + "\n</body>")
             else:
-                html += js
+                html += inject
 
             with open(map_file, "w", encoding="utf-8") as f:
                 f.write(html)
 
-            logger.info("InjectJS: вставив webchannel click handler у %s", map_file)
+            logger.info("InjectJS: підключено map_bridge.js → %s", map_file)
 
         except Exception as e:
             logger.exception("InjectJS помилка: %s", e)
@@ -568,6 +637,7 @@ class MapRenderWorker(QThread):
             map_file = os.path.join(DIR_OUTPUTS, f"{self.safe_city_name}_map_{ts}.html")
             m.save(map_file)
 
+            # інжектимо міст для кліків (якщо увімкнено)
             self._inject_click_bridge_js(map_file)
 
             self.progress.emit(100)

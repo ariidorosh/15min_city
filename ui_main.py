@@ -7,7 +7,7 @@ from PyQt5.QtWidgets import (
     QPushButton, QScrollArea, QComboBox, QLineEdit, QToolButton, QSizePolicy,
     QProgressBar, QMessageBox
 )
-from PyQt5.QtWebEngineWidgets import QWebEngineView
+from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage
 from PyQt5.QtCore import Qt, QUrl, QThread, pyqtSignal, QObject, pyqtSlot
 
 WEBCHANNEL_AVAILABLE = True
@@ -36,12 +36,29 @@ COUNTRY_MAP = {
 }
 
 
-class MapBridge(QObject):
-    picked = pyqtSignal(float, float)
+class LoggingWebPage(QWebEnginePage):
+    """
+    Виводить console.log/console.error з JS у ваш logger.
+    Дуже допомагає побачити, на чому саме стопориться map_bridge.js
+    """
+    def javaScriptConsoleMessage(self, level, message, lineNumber, sourceID):
+        try:
+            logger.info("JS console [%s] %s:%s %s", level, sourceID, lineNumber, message)
+        except Exception:
+            pass
 
-    @pyqtSlot(float, float)
-    def map_clicked(self, lat, lon):
-        self.picked.emit(float(lat), float(lon))
+
+class MapBridge(QObject):
+    picked = pyqtSignal(float, float, str, str)
+
+    @pyqtSlot(float, float, str, str, name="map_clicked")
+    def map_clicked(self, lat, lon, target, category):
+        self.picked.emit(
+            float(lat),
+            float(lon),
+            str(target or ""),
+            str(category or "")
+        )
 
 
 class CitySearchWorker(QThread):
@@ -361,16 +378,24 @@ class MainWindow(QMainWindow):
         for w in self.addr_widgets:
             self.left_layout.addWidget(w)
 
+        # --- click picking buttons ---
         self.btn_pick_start = QPushButton("Вибрати старт на карті")
         self.btn_pick_end = QPushButton("Вибрати фініш на карті")
+        self.btn_pick_stop = QPushButton("Додати stop на карті")
+        self.btn_clear_stops = QPushButton("Очистити stops")
+
         self.btn_pick_start.clicked.connect(lambda: self._set_pick_target("start"))
         self.btn_pick_end.clicked.connect(lambda: self._set_pick_target("end"))
+        self.btn_pick_stop.clicked.connect(lambda: self._set_pick_target("stop"))
+        self.btn_clear_stops.clicked.connect(self._clear_stops)
 
         if not WEBCHANNEL_AVAILABLE:
             self.btn_pick_start.setEnabled(False)
             self.btn_pick_end.setEnabled(False)
+            self.btn_pick_stop.setEnabled(False)
+            self.btn_clear_stops.setEnabled(False)
 
-        self.click_widgets = [self.btn_pick_start, self.btn_pick_end]
+        self.click_widgets = [self.btn_pick_start, self.btn_pick_end, self.btn_pick_stop, self.btn_clear_stops]
         for w in self.click_widgets:
             self.left_layout.addWidget(w)
 
@@ -391,7 +416,7 @@ class MainWindow(QMainWindow):
         self.btn_route.clicked.connect(self.build_route_only)
 
         # ============================================================
-        # Прогрес / статус (логічно біля побудов)
+        # Прогрес / статус
         # ============================================================
         self.progress_label = QLabel("")
         self.progress_bar = QProgressBar()
@@ -416,6 +441,7 @@ class MainWindow(QMainWindow):
         left_scroll.setWidget(self.left_panel)
 
         self.web_view = QWebEngineView()
+        self.web_view.setPage(LoggingWebPage(self.web_view))
         self.web_view.loadFinished.connect(self._on_web_load_finished)
 
         self.main_layout.addWidget(left_scroll, 1)
@@ -423,7 +449,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(container)
 
         # ------------------------------------------------------------
-        # WebChannel (клік по карті)
+        # WebChannel (клік по карті) — підключаємо ПІСЛЯ setPage(...)
         # ------------------------------------------------------------
         self._bridge = None
         self._channel = None
@@ -447,7 +473,10 @@ class MainWindow(QMainWindow):
         self._pick_target = ""
         self._picked_start = None
         self._picked_end = None
+        self._picked_stops = []  # list[(lat, lon)]
 
+        # щоб одразу було зрозуміло, яка країна вибрана за замовчуванням
+        self.country_selected()
         self._update_route_mode_ui()
 
     # -------- helpers --------
@@ -501,6 +530,17 @@ class MainWindow(QMainWindow):
             return COUNTRY_MAP[self.selected_country]
         return ("ua", "uk")
 
+    def _ui_via_category_value(self) -> str:
+        """
+        Переклад з UI у те, що очікує path_finder/visualizer.
+        """
+        t = (self.via_category.currentText() or "").strip().lower()
+        if "нема" in t:
+            return "none"
+        if "парк" in t:
+            return "park"
+        return "none"
+
     def _update_route_mode_ui(self):
         mode = self.route_mode.currentText()
 
@@ -532,34 +572,62 @@ class MainWindow(QMainWindow):
             return
         if WEBCHANNEL_AVAILABLE:
             tgt = self._pick_target or ""
-            js = f"window.__pick_target = {json.dumps(tgt)};"
-            self.web_view.page().runJavaScript(js)
+            cat = self._ui_via_category_value()
+            self.web_view.page().runJavaScript(f"window.__pick_target = {json.dumps(tgt)};")
+            self.web_view.page().runJavaScript(f"window.__pick_category = {json.dumps(cat)};")
 
     def _set_pick_target(self, target: str):
         if not WEBCHANNEL_AVAILABLE:
             QMessageBox.warning(self, "Клік по карті", "QtWebChannel недоступний у вашому середовищі.")
             return
-        if target not in ("start", "end"):
+        if target not in ("start", "end", "stop"):
             target = ""
         self._pick_target = target
-        self._set_status(f"Клік по карті: вибери {('СТАРТ' if target=='start' else 'ФІНІШ')} на мапі")
-        self.web_view.page().runJavaScript(f"window.__pick_target = {json.dumps(target)};")
 
-    def _on_map_picked(self, lat: float, lon: float):
-        if not self._pick_target:
+        if target == "start":
+            self._set_status("Клік по карті: вибери СТАРТ на мапі")
+        elif target == "end":
+            self._set_status("Клік по карті: вибери ФІНІШ на мапі")
+        elif target == "stop":
+            self._set_status("Клік по карті: додавай STOP-и (можна кілька).")
+
+        self.web_view.page().runJavaScript(f"window.__pick_target = {json.dumps(target)};")
+        self.web_view.page().runJavaScript(f"window.__pick_category = {json.dumps(self._ui_via_category_value())};")
+
+    def _on_map_picked(self, lat: float, lon: float, target: str, category: str):
+        tgt = (target or self._pick_target or "").strip().lower()
+        if not tgt:
             return
 
-        if self._pick_target == "start":
+        if tgt == "start":
             self._picked_start = (lat, lon)
             self.route_start.setText(f"{lat:.6f}, {lon:.6f}")
-            self._set_status("Старт обрано. Тепер вибери фініш або будуй маршрут.")
+            self._set_status("Старт обрано. Тепер вибери фініш / stop-и або будуй маршрут.")
             logger.info("UI: picked START on map: lat=%.6f lon=%.6f", lat, lon)
 
-        elif self._pick_target == "end":
+        elif tgt == "end":
             self._picked_end = (lat, lon)
             self.route_end.setText(f"{lat:.6f}, {lon:.6f}")
             self._set_status("Фініш обрано. Можеш будувати маршрут.")
             logger.info("UI: picked END on map: lat=%.6f lon=%.6f", lat, lon)
+
+        elif tgt == "stop":
+            self._picked_stops.append((lat, lon))
+            self._set_status(f"Додано stop #{len(self._picked_stops)}: {lat:.6f}, {lon:.6f}")
+            logger.info("UI: picked STOP #%d: lat=%.6f lon=%.6f", len(self._picked_stops), lat, lon)
+
+    def _clear_stops(self):
+        self._picked_stops = []
+        self._set_status("Stops очищено.")
+        if WEBCHANNEL_AVAILABLE:
+            self.web_view.page().runJavaScript("""
+                try {
+                  if (window.__stopMarkers && window.__stopMarkers.length) {
+                    for (var i=0;i<window.__stopMarkers.length;i++) { window.__stopMarkers[i].remove(); }
+                  }
+                  window.__stopMarkers = [];
+                } catch(e) {}
+            """)
 
     # -------- city search --------
     def search_city(self):
@@ -666,11 +734,14 @@ class MainWindow(QMainWindow):
 
         self._set_busy(True)
 
+        # скидаємо вибори для кліків
         self._picked_start = None
         self._picked_end = None
+        self._picked_stops = []
         self._pick_target = ""
         if WEBCHANNEL_AVAILABLE:
             self.web_view.page().runJavaScript("window.__pick_target = '';")
+            self.web_view.page().runJavaScript("window.__pick_category = 'none';")
 
         worker = GraphWorker(city, required_tokens)
         worker.status.connect(self._set_status)
@@ -720,6 +791,8 @@ class MainWindow(QMainWindow):
             route_start_latlon=None,
             route_end_latlon=None,
             route_algorithm="dijkstra",
+            route_via_category="none",
+            route_stops=[],
             enable_click_pick=WEBCHANNEL_AVAILABLE,
         )
         mworker.status.connect(self._set_status)
@@ -777,14 +850,21 @@ class MainWindow(QMainWindow):
         alg = (self.route_alg.currentText() or "dijkstra").strip()
         level = self._current_level()
         mode = self.route_mode.currentText()
+        via = self._ui_via_category_value()
 
         logger.info(
-            "UI: build route requested | mode=%s | alg=%s | start=%s | end=%s",
-            mode, alg, start_latlon, end_latlon
+            "UI: build route requested | mode=%s | alg=%s | start=%s | end=%s | stops=%d | via=%s",
+            mode, alg, start_latlon, end_latlon, len(self._picked_stops), via
         )
         try:
+            extra = ""
+            if self._picked_stops:
+                extra = f" | stops={len(self._picked_stops)}"
+            elif via and via != "none":
+                extra = f" | via={via}"
+
             self._set_status(
-                f"Маршрут: {mode} | alg={alg} | "
+                f"Маршрут: {mode} | alg={alg}{extra} | "
                 f"старт {start_latlon[0]:.6f},{start_latlon[1]:.6f} → "
                 f"фініш {end_latlon[0]:.6f},{end_latlon[1]:.6f}"
             )
@@ -803,6 +883,8 @@ class MainWindow(QMainWindow):
             route_start_latlon=start_latlon,
             route_end_latlon=end_latlon,
             route_algorithm=alg,
+            route_via_category=via,
+            route_stops=list(self._picked_stops),
             enable_click_pick=WEBCHANNEL_AVAILABLE,
         )
         mworker.status.connect(self._set_status)

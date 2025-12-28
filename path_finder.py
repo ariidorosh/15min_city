@@ -94,6 +94,23 @@ class PathResult:
 
 
 @dataclass(frozen=True)
+class MultiPathResult:
+    """
+    Маршрут через кілька точок:
+      points = [start, stop1, stop2, ..., end]
+    segments — список PathResult для кожної пари (i -> i+1).
+    nodes/coords/length_m — зшиті "в один" маршрут.
+    """
+    points: List[LatLon]
+    segments: List[PathResult]
+    nodes: List[int]
+    coords: List[LatLon]
+    length_m: float
+    algorithm: Algorithm
+    weight: str
+
+
+@dataclass(frozen=True)
 class IsochroneResult:
     center_node: int
     cutoff: float
@@ -378,7 +395,6 @@ def _interpolate_along_linestring(
         p1 = geom.interpolate(end_d)
         return [(float(p0.y), float(p0.x)), (float(p1.y), float(p1.x))]
 
-    # крок у "геом-одиницях"
     step_d = (float(step_m) / float(edge_length_m)) * geom_len
     if step_d <= 0:
         step_d = geom_len / 20.0
@@ -409,7 +425,6 @@ def snap_to_graph(G, latlon: LatLon, *, mode: SnapMode = "edge") -> SnapInfo:
     _validate_latlon(latlon, "latlon")
     in_ll: LatLon = (float(latlon[0]), float(latlon[1]))
 
-    # --- mode=node (fallback) ---
     if mode == "node":
         n = nearest_node(G, in_ll)
         n_ll = _node_latlon(G, n)
@@ -424,7 +439,6 @@ def snap_to_graph(G, latlon: LatLon, *, mode: SnapMode = "edge") -> SnapInfo:
             dist_to_node_m=float(d),
         )
 
-    # --- mode=edge ---
     ne = _nearest_edges_func()
     if ne is None:
         return snap_to_graph(G, in_ll, mode="node")
@@ -438,10 +452,8 @@ def snap_to_graph(G, latlon: LatLon, *, mode: SnapMode = "edge") -> SnapInfo:
 
     u, v, key = _pick_edge_tuple(raw_edge)
 
-    # геометрія ребра + довжина (в метрах)
     geom, edge_len_m = _geometry_from_edge(G, u, v, key=key, prefer_exact_key=True, weight="length")
 
-    # snapped point (проєкція на геометрію)
     p = Point(lon, lat)
     try:
         proj_d = float(geom.project(p))
@@ -453,11 +465,9 @@ def snap_to_graph(G, latlon: LatLon, *, mode: SnapMode = "edge") -> SnapInfo:
     except Exception:
         return snap_to_graph(G, in_ll, mode="node")
 
-    # скільки "по ребру" до u і до v
     cost_to_u = float(pos01) * float(edge_len_m)
     cost_to_v = (1.0 - float(pos01)) * float(edge_len_m)
 
-    # для інфи залишимо chosen_node як ближчий "по ребру"
     chosen = u if cost_to_u <= cost_to_v else v
     chosen_ll = _node_latlon(G, chosen)
 
@@ -720,13 +730,8 @@ def find_shortest_path(
         {k: round(v, 2) for k, v in end_candidates.items()},
     )
 
-    # --------------------------------------------------------
-    # Вибір найкращих кінців ребер (u/v) за сумарною довжиною:
-    # start_extra + shortest_path_length + end_extra
-    # --------------------------------------------------------
     best_pair: Optional[Tuple[int, int]] = None
     best_total: float = float("inf")
-    best_core_len: float = float("inf")
 
     for s_node, s_extra in start_candidates.items():
         for e_node, e_extra in end_candidates.items():
@@ -743,7 +748,6 @@ def find_shortest_path(
             if total < best_total:
                 best_total = total
                 best_pair = (int(s_node), int(e_node))
-                best_core_len = float(core_len)
 
     if best_pair is None:
         raise PathNotFoundError(
@@ -764,9 +768,6 @@ def find_shortest_path(
     start_extra = float(start_candidates.get(start_node, 0.0))
     end_extra = float(end_candidates.get(end_node, 0.0))
 
-    # --------------------------------------------------------
-    # Основний маршрут по графу (від start_node до end_node)
-    # --------------------------------------------------------
     try:
         if algorithm == "dijkstra":
             path_nodes = nx.shortest_path(Gwork, start_node, end_node, weight=weight)
@@ -821,13 +822,6 @@ def find_shortest_path(
             cause=e,
         )
 
-    # --------------------------------------------------------
-    # Координати:
-    #  - стартуємо в snapped START (на дорозі)
-    #  - по ребру до вибраного вузла (з поворотами)
-    #  - далі core маршрут по ребрах (з поворотами)
-    #  - потім по ребру до snapped END (на дорозі)
-    # --------------------------------------------------------
     core_coords = route_coords_from_edges(Gwork, [int(n) for n in path_nodes], weight=weight)
 
     coords: List[LatLon] = []
@@ -836,7 +830,6 @@ def find_shortest_path(
         prefix = _edge_segment_from_snapped_to_node(Gwork, snap_s, start_node, weight=weight)
         _extend_dedup(coords, prefix)
     else:
-        # node-mode: стартуємо з вузла
         _extend_dedup(coords, [_node_latlon(Gwork, start_node)])
 
     _extend_dedup(coords, core_coords)
@@ -845,7 +838,6 @@ def find_shortest_path(
         suffix = _edge_segment_from_node_to_snapped(Gwork, snap_e, end_node, weight=weight)
         _extend_dedup(coords, suffix)
     else:
-        # node-mode: кінець у вузлі
         _extend_dedup(coords, [_node_latlon(Gwork, end_node)])
 
     length = float(core_len) + float(start_extra) + float(end_extra)
@@ -868,6 +860,86 @@ def find_shortest_path(
         nodes=[int(n) for n in path_nodes],
         coords=coords,
         length_m=float(length),
+        algorithm=algorithm,
+        weight=weight,
+    )
+
+
+# ============================================================
+# Multi-stop: start -> stop1 -> stop2 -> ... -> end
+# ============================================================
+def _concat_coords_dedup(a: List[LatLon], b: List[LatLon]) -> List[LatLon]:
+    out: List[LatLon] = []
+    _extend_dedup(out, a or [])
+    _extend_dedup(out, b or [])
+    return out
+
+
+def _concat_nodes_dedup(a: List[int], b: List[int]) -> List[int]:
+    if not a:
+        return list(b)
+    if not b:
+        return list(a)
+    if int(a[-1]) == int(b[0]):
+        return list(a) + list(b[1:])
+    return list(a) + list(b)
+
+
+def find_shortest_path_multi(
+    G,
+    points: List[LatLon],
+    *,
+    weight: str = "length",
+    algorithm: Algorithm = "dijkstra",
+    use_undirected: bool = False,
+    snap_mode: SnapMode = "edge",
+) -> MultiPathResult:
+    """
+    Будує маршрут через кілька точок.
+    Реалізація навмисно проста й надійна: сегментами i->i+1, потім “зшивка”.
+    """
+    if points is None or len(points) < 2:
+        raise PathfinderError("Multi-stop потребує мінімум 2 точки", code="INVALID_MULTISTOP_POINTS")
+
+    # Валідація всіх точок
+    for i, p in enumerate(points):
+        _validate_latlon(p, f"points[{i}]")
+
+    segments: List[PathResult] = []
+    all_nodes: List[int] = []
+    all_coords: List[LatLon] = []
+    total_len = 0.0
+
+    for i in range(len(points) - 1):
+        seg = find_shortest_path(
+            G,
+            points[i],
+            points[i + 1],
+            weight=weight,
+            algorithm=algorithm,
+            use_undirected=use_undirected,
+            snap_mode=snap_mode,
+        )
+        segments.append(seg)
+        total_len += float(seg.length_m)
+
+        # зшивка nodes/coords
+        if not all_nodes:
+            all_nodes = list(seg.nodes)
+        else:
+            all_nodes = _concat_nodes_dedup(all_nodes, list(seg.nodes))
+
+        if not all_coords:
+            all_coords = list(seg.coords)
+        else:
+            all_coords = _concat_coords_dedup(all_coords, list(seg.coords))
+
+    return MultiPathResult(
+        points=[(float(p[0]), float(p[1])) for p in points],
+        segments=segments,
+        nodes=[int(n) for n in all_nodes],
+        coords=[(float(a), float(b)) for (a, b) in all_coords],
+        length_m=float(total_len),
         algorithm=algorithm,
         weight=weight,
     )
@@ -933,9 +1005,9 @@ def compute_isochrone(
 
 
 # ============================================================
-# MVP: маршрут через категорію POI (наприклад "park")
+# MVP/Helper: маршрут через категорію POI
+# (тепер підтримує не тільки park, а й універсальний формат)
 # ============================================================
-
 @dataclass(frozen=True)
 class ViaStopSelection:
     category: str
@@ -946,32 +1018,76 @@ class ViaStopSelection:
     total_m: float
 
 
+def _parse_category_spec(category: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Універсальний парсер категорії:
+      - "amenity=cafe"  -> ("amenity", "cafe")
+      - "amenity:cafe"  -> ("amenity", "cafe")
+      - "leisure=park"  -> ("leisure", "park")
+      - "park"          -> (None, "park")   # value-only fallback
+    """
+    cat = (category or "").strip()
+    if not cat:
+        return None, None
+
+    if "=" in cat:
+        k, v = cat.split("=", 1)
+        return (k.strip().lower() or None), (v.strip().lower() or None)
+
+    if ":" in cat:
+        k, v = cat.split(":", 1)
+        return (k.strip().lower() or None), (v.strip().lower() or None)
+
+    return None, cat.strip().lower()
+
+
 def _poi_candidates_for_category(gdf_all_poi, category: str):
     """
-    Повертає GeoDataFrame підмножину POI по категорії.
-    MVP: підтримує category='park'
-    Працює з форматом (poi_key/poi_value) або з колонкою 'leisure'.
+    Повертає GeoDataFrame підмножину POI за категорією.
+
+    Підтримка:
+      1) Твій стандартний формат: 'poi_key'/'poi_value':
+         - category "leisure=park" / "leisure:park" / "park"(fallback)
+      2) Якщо POI розкладені в колонки (наприклад 'amenity', 'shop', 'leisure'):
+         - category "amenity=cafe" тощо.
     """
     if gdf_all_poi is None or getattr(gdf_all_poi, "empty", True):
         return None
 
-    cat = (category or "").strip().lower()
-    if not cat:
+    key, val = _parse_category_spec(category)
+    if not val:
         return None
 
-    if cat == "park":
-        # Основний варіант у твоєму пайплайні: poi_key/poi_value
-        if ("poi_key" in gdf_all_poi.columns) and ("poi_value" in gdf_all_poi.columns):
-            m = (gdf_all_poi["poi_key"] == "leisure") & (gdf_all_poi["poi_value"].astype(str) == "park")
+    # --- 1) пайплайновий варіант poi_key/poi_value ---
+    if ("poi_key" in gdf_all_poi.columns) and ("poi_value" in gdf_all_poi.columns):
+        if key:
+            m = (gdf_all_poi["poi_key"].astype(str).str.lower() == key) & (
+                gdf_all_poi["poi_value"].astype(str).str.lower() == val
+            )
+            out = gdf_all_poi[m]
+            if not getattr(out, "empty", True):
+                return out
+        else:
+            # value-only fallback: знайдемо будь-який poi_value == val
+            m = gdf_all_poi["poi_value"].astype(str).str.lower() == val
             out = gdf_all_poi[m]
             if not getattr(out, "empty", True):
                 return out
 
-        # fallback: якщо є колонка leisure
-        if "leisure" in gdf_all_poi.columns:
-            out = gdf_all_poi[gdf_all_poi["leisure"].astype(str) == "park"]
-            if not getattr(out, "empty", True):
-                return out
+    # --- 2) fallback: POI можуть бути “рознесені” по колонках (amenity, shop, leisure...) ---
+    if key and (key in gdf_all_poi.columns):
+        out = gdf_all_poi[gdf_all_poi[key].astype(str).str.lower() == val]
+        if not getattr(out, "empty", True):
+            return out
+
+    # --- 3) останній fallback: пройдемось по кількох типових колонках ---
+    # (це корисно якщо category="cafe" без ключа)
+    if not key:
+        for k in ("amenity", "shop", "leisure", "tourism", "office", "healthcare", "sport"):
+            if k in gdf_all_poi.columns:
+                out = gdf_all_poi[gdf_all_poi[k].astype(str).str.lower() == val]
+                if not getattr(out, "empty", True):
+                    return out
 
     return None
 
@@ -994,23 +1110,6 @@ def _geom_to_latlon_safe(geom) -> Optional[LatLon]:
         return None
 
 
-def _concat_coords_dedup(a: List[LatLon], b: List[LatLon]) -> List[LatLon]:
-    out: List[LatLon] = []
-    _extend_dedup(out, a or [])
-    _extend_dedup(out, b or [])
-    return out
-
-
-def _concat_nodes_dedup(a: List[int], b: List[int]) -> List[int]:
-    if not a:
-        return list(b)
-    if not b:
-        return list(a)
-    if int(a[-1]) == int(b[0]):
-        return list(a) + list(b[1:])
-    return list(a) + list(b)
-
-
 def find_shortest_path_via_poi_category(
     G,
     gdf_all_poi,
@@ -1023,25 +1122,22 @@ def find_shortest_path_via_poi_category(
     use_undirected: bool = False,
     snap_mode: SnapMode = "edge",
     # швидкість/якість:
-    prefilter_max: int = 400,          # скільки парків беремо "поблизу" для кандидатів
-    max_candidates_to_check: int = 25, # скільки реально пробуємо маршрутом
+    prefilter_max: int = 400,
+    max_candidates_to_check: int = 25,
 ) -> Tuple[PathResult, ViaStopSelection]:
     """
-    MVP: "пройти через парк" (або іншу категорію) і зробити сумарний шлях найкоротшим.
+    Маршрут “через POI категорії” так, щоб сумарна довжина була мінімальна:
+      len(start->poi) + len(poi->end)
 
-    Стратегія (проста і надійна):
-      1) беремо всі POI категорії (park)
-      2) сортуємо по відстані до середини між start/end
-      3) беремо top-N кандидатів і для кожного рахуємо:
-         len(start->poi) + len(poi->end) реальним роутером find_shortest_path
-      4) вибираємо найменший.
-
-    Повертає (PathResult, ViaStopSelection).
+    via_category підтримує:
+      - "amenity=cafe", "amenity:cafe"
+      - "leisure=park", "leisure:park"
+      - "park" (fallback по значенню)
     """
     _validate_latlon(start_latlon, "start_latlon")
     _validate_latlon(end_latlon, "end_latlon")
 
-    cat = (via_category or "").strip().lower()
+    cat = (via_category or "").strip()
     if not cat:
         raise PathfinderError("via_category порожня", code="INVALID_VIA_CATEGORY")
 
@@ -1053,8 +1149,11 @@ def find_shortest_path_via_poi_category(
             context={"category": cat},
         )
 
-    # середина між start/end (для “розумного” prefilter)
-    mid = ((float(start_latlon[0]) + float(end_latlon[0])) / 2.0, (float(start_latlon[1]) + float(end_latlon[1])) / 2.0)
+    # середина між start/end для “розумного” prefilter
+    mid = (
+        (float(start_latlon[0]) + float(end_latlon[0])) / 2.0,
+        (float(start_latlon[1]) + float(end_latlon[1])) / 2.0,
+    )
 
     scored = []
     for _, row in gdf.iterrows():
@@ -1063,7 +1162,18 @@ def find_shortest_path_via_poi_category(
             continue
 
         d_mid = _haversine_m(ll, mid)
-        label = str(row.get("name") or row.get("brand") or row.get("poi_value") or "POI")
+
+        # мітка POI: максимально “людська”
+        label = str(
+            row.get("name")
+            or row.get("brand")
+            or row.get("operator")
+            or row.get("poi_value")
+            or row.get("amenity")
+            or row.get("shop")
+            or row.get("leisure")
+            or "POI"
+        )
         scored.append((float(d_mid), ll, label))
 
     if not scored:
@@ -1116,7 +1226,7 @@ def find_shortest_path_via_poi_category(
             best_r1 = r1
             best_r2 = r2
             best_sel = ViaStopSelection(
-                category=cat,
+                category=str(cat),
                 label=label,
                 poi_latlon=poi_ll,
                 dist_start_to_poi_m=float(r1.length_m),
