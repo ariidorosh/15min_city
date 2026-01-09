@@ -954,6 +954,7 @@ def compute_isochrone(
     cutoff: float,
     weight: str = "length",
     use_undirected: bool = False,
+    snap_mode: SnapMode = "edge",
     build_polygon: bool = True,
     polygon_buffer_m: float = 0.0,
 ) -> IsochroneResult:
@@ -962,7 +963,7 @@ def compute_isochrone(
         raise PathfinderError("cutoff має бути > 0", code="INVALID_CUTOFF", context={"cutoff": cutoff, "weight": weight})
 
     Gwork = G.to_undirected() if use_undirected else G
-    snap_c = snap_to_graph(Gwork, center_latlon, mode="edge")
+    snap_c = snap_to_graph(Gwork, center_latlon, mode=snap_mode)
     center_node = int(snap_c.chosen_node)
 
     logger.info("Isochrone: center=%s (node=%s), cutoff=%s, weight=%s", center_latlon, center_node, cutoff, weight)
@@ -1007,7 +1008,6 @@ def compute_isochrone(
 
 # ============================================================
 # MVP/Helper: маршрут через категорію POI
-# (тепер підтримує не тільки park, а й універсальний формат)
 # ============================================================
 @dataclass(frozen=True)
 class ViaStopSelection:
@@ -1111,6 +1111,19 @@ def _geom_to_latlon_safe(geom) -> Optional[LatLon]:
         return None
 
 
+def _sample_route_points(coords: List[LatLon], max_points: int) -> List[LatLon]:
+    if not coords:
+        return []
+    max_points = max(20, int(max_points))
+    if len(coords) <= max_points:
+        return list(coords)
+    step = max(1, len(coords) // max_points)
+    out = list(coords[::step])
+    if out[-1] != coords[-1]:
+        out.append(coords[-1])
+    return out
+
+
 def find_shortest_path_via_poi_category(
     G,
     gdf_all_poi,
@@ -1125,10 +1138,19 @@ def find_shortest_path_via_poi_category(
     # швидкість/якість:
     prefilter_max: int = 400,
     max_candidates_to_check: int = 25,
+    # НОВЕ:
+    detour_limit_m: Optional[float] = None,     # ліміт відхилення від shortest у метрах
+    route_sample_max_points: int = 250,         # семпл точок shortest-маршруту (для швидкості)
 ) -> Tuple[PathResult, ViaStopSelection]:
     """
     Маршрут “через POI категорії” так, щоб сумарна довжина була мінімальна:
       len(start->poi) + len(poi->end)
+
+    Логіка:
+      1) Рахуємо найкоротший start->end
+      2) Шукаємо POI, які найближчі ДО ЦЬОГО маршруту (а не до mid-point)
+      3) Пробуємо start->poi->end, обираємо найкращий, але:
+         якщо detour_limit_m заданий — відкидаємо варіанти, де (total - base) > detour_limit_m
 
     via_category підтримує:
       - "amenity=cafe", "amenity:cafe"
@@ -1150,21 +1172,40 @@ def find_shortest_path_via_poi_category(
             context={"category": cat},
         )
 
-    # середина між start/end для “розумного” prefilter
-    mid = (
-        (float(start_latlon[0]) + float(end_latlon[0])) / 2.0,
-        (float(start_latlon[1]) + float(end_latlon[1])) / 2.0,
+    # 1) Базовий найкоротший маршрут
+    base = find_shortest_path(
+        G,
+        start_latlon,
+        end_latlon,
+        weight=weight,
+        algorithm=algorithm,
+        use_undirected=use_undirected,
+        snap_mode=snap_mode,
     )
+    base_len = float(base.length_m)
+    base_pts = list(base.coords or [])
+    if not base_pts:
+        base_pts = [start_latlon, end_latlon]
 
+    route_pts = _sample_route_points(base_pts, route_sample_max_points)
+
+    def _dist_to_route_m(poi_ll: LatLon) -> float:
+        best = float("inf")
+        for pt in route_pts:
+            d = _haversine_m(poi_ll, pt)
+            if d < best:
+                best = d
+        return float(best)
+
+    # 2) Ранжуємо POI за близькістю до базового маршруту
     scored = []
     for _, row in gdf.iterrows():
         ll = _geom_to_latlon_safe(row.get("geometry"))
         if ll is None:
             continue
 
-        d_mid = _haversine_m(ll, mid)
+        d_route = _dist_to_route_m(ll)
 
-        # мітка POI: максимально “людська”
         label = str(
             row.get("name")
             or row.get("brand")
@@ -1175,7 +1216,7 @@ def find_shortest_path_via_poi_category(
             or row.get("leisure")
             or "POI"
         )
-        scored.append((float(d_mid), ll, label))
+        scored.append((float(d_route), ll, label))
 
     if not scored:
         raise PathfinderError(
@@ -1196,7 +1237,11 @@ def find_shortest_path_via_poi_category(
     best_r2: Optional[PathResult] = None
     best_sel: Optional[ViaStopSelection] = None
 
-    for _dmid, poi_ll, label in cand_pool:
+    # для діагностики детуру (на випадок, якщо все “вилітає” по ліміту)
+    best_any_total = float("inf")
+    best_any_detour = float("inf")
+
+    for _droute, poi_ll, label in cand_pool:
         try:
             r1 = find_shortest_path(
                 G,
@@ -1222,6 +1267,16 @@ def find_shortest_path_via_poi_category(
             continue
 
         total = float(r1.length_m) + float(r2.length_m)
+        detour = float(total - base_len)
+
+        if total < best_any_total:
+            best_any_total = total
+            best_any_detour = detour
+
+        # 3) Ліміт детуру (якщо задано)
+        if detour_limit_m is not None and detour > float(detour_limit_m):
+            continue
+
         if total < best_total:
             best_total = total
             best_r1 = r1
@@ -1236,6 +1291,21 @@ def find_shortest_path_via_poi_category(
             )
 
     if best_r1 is None or best_r2 is None or best_sel is None:
+        # якщо маршрути через категорію існували, але все відсіклося по detour_limit
+        if detour_limit_m is not None and best_any_total < float("inf"):
+            raise PathfinderError(
+                "Маршрут через категорію існує, але не вкладається в ліміт відхилення від найкоротшого",
+                code="VIA_DETOUR_LIMIT",
+                context={
+                    "category": cat,
+                    "checked": len(cand_pool),
+                    "base_len_m": float(base_len),
+                    "detour_limit_m": float(detour_limit_m),
+                    "best_total_m": float(best_any_total),
+                    "best_detour_m": float(best_any_detour),
+                },
+            )
+
         raise PathNotFoundError(
             "Не вдалося побудувати маршрут через цю категорію (кандидати не дали валідний шлях)",
             context={"category": cat, "checked": len(cand_pool)},

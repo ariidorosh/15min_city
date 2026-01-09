@@ -416,6 +416,22 @@ class MainWindow(QMainWindow):
         self.btn_route.clicked.connect(self.build_route_only)
 
         # ============================================================
+        # 5.1) Ізохрони (НОВЕ)
+        # ============================================================
+        self.left_layout.addWidget(QLabel("Ізохрони (від точки старту):"))
+
+        self.iso_select = QComboBox()
+        self.iso_select.addItems(["5 хв", "10 хв", "15 хв", "5/10/15"])
+        self.iso_select.setCurrentIndex(3)
+        self.left_layout.addWidget(self.iso_select)
+
+        self.btn_isochrone = QPushButton("Побудувати ізохрону")
+        self.btn_isochrone.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.btn_isochrone.setMinimumHeight(40)
+        self.left_layout.addWidget(self.btn_isochrone)
+        self.btn_isochrone.clicked.connect(self.build_isochrone_only)
+
+        # ============================================================
         # Прогрес / статус
         # ============================================================
         self.progress_label = QLabel("")
@@ -487,6 +503,7 @@ class MainWindow(QMainWindow):
         self.btn_build.setEnabled(not busy)
         self.btn_clear_cache.setEnabled(not busy)
         self.btn_route.setEnabled(not busy)
+        self.btn_isochrone.setEnabled(not busy)
 
         self.progress_bar.setVisible(show_progress and busy)
         if busy:
@@ -718,7 +735,7 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "Адреса", msg)
         self._set_status("")
 
-    # -------- build map / route --------
+    # -------- build map / route / isochrone --------
     def build_map(self):
         city = self._current_city_for_address()
         if not city:
@@ -898,6 +915,110 @@ class MainWindow(QMainWindow):
         self._threads.append(mworker)
         mworker.start()
 
+    # -------- isochrone --------
+    def _parse_iso_minutes(self) -> list:
+        t = (self.iso_select.currentText() or "").strip()
+        if t.startswith("5/10/15"):
+            return [5, 10, 15]
+        if t.startswith("5"):
+            return [5]
+        if t.startswith("10"):
+            return [10]
+        if t.startswith("15"):
+            return [15]
+        return [5, 10, 15]
+
+    def _get_isochrone_center_by_mode(self):
+        """
+        Ізохрона будується від "Старту" у поточному режимі вводу:
+          - Координати: беремо route_start
+          - Адреса: беремо addr_start_results
+          - Клік по карті: беремо _picked_start
+        """
+        mode = self.route_mode.currentText()
+
+        if mode == "Координати":
+            return parse_latlon_text(self.route_start.text(), "Центр ізохрони (Старт)")
+
+        if mode == "Адреса":
+            if self.addr_start_results.count() == 0:
+                raise ValueError("Спочатку знайди старт через кнопку пошуку адреси.")
+            start = self.addr_start_results.currentData()
+            if not start:
+                raise ValueError("Вибери варіант стартової адреси зі списку.")
+            return tuple(start)
+
+        if mode == "Клік по карті":
+            if not self._picked_start:
+                raise ValueError("Спочатку вибери старт на карті (кнопка 'Вибрати старт на карті').")
+            return self._picked_start
+
+        raise ValueError("Невідомий режим вводу.")
+
+    def build_isochrone_only(self):
+        if (
+            self._last_G is None or self._last_gdf_edges is None
+            or self._last_city is None or self._last_safe_city is None
+        ):
+            QMessageBox.information(self, "Ізохрона", "Спочатку побудуй карту для міста (кнопка 'Побудувати карту').")
+            return
+        if self._last_gdf_all_poi is None:
+            QMessageBox.information(self, "Ізохрона", "POI ще не завантажились. Спробуй ще раз через пару секунд.")
+            return
+
+        try:
+            center = self._get_isochrone_center_by_mode()
+        except Exception as e:
+            QMessageBox.warning(self, "Ізохрона", str(e))
+            return
+
+        minutes_list = self._parse_iso_minutes()
+        level = self._current_level()
+
+        logger.info("UI: build isochrone requested | center=%s | minutes=%s", center, minutes_list)
+        try:
+            self._set_status(f"Ізохрона: центр {center[0]:.6f},{center[1]:.6f} | хв={minutes_list}")
+        except Exception:
+            self._set_status(f"Ізохрона: center={center} | minutes={minutes_list}")
+
+        self._set_busy(True)
+
+        mworker = MapRenderWorker(
+            self._last_G,
+            self._last_gdf_edges,
+            self._last_gdf_all_poi,
+            self._last_safe_city,
+            self._last_city,
+            level,
+
+            # маршрут не будуємо
+            route_start_latlon=None,
+            route_end_latlon=None,
+            route_algorithm="dijkstra",
+            route_via_category="none",
+            route_stops=[],
+
+            enable_click_pick=WEBCHANNEL_AVAILABLE,
+
+            # ізохрони
+            isochrone_center_latlon=center,
+            isochrone_minutes=minutes_list,
+            isochrone_walk_speed_kmh=4.8,
+            isochrone_buffer_m=0.0,
+        )
+
+        mworker.status.connect(self._set_status)
+        mworker.progress.connect(self.progress_bar.setValue)
+        mworker.finished.connect(self._on_map_ready)
+        mworker.error.connect(self._on_build_error)
+
+        mworker.finished.connect(lambda *_: self._cleanup_thread(mworker))
+        mworker.error.connect(lambda *_: self._cleanup_thread(mworker))
+
+        self._threads.append(mworker)
+        mworker.start()
+
+    # -------- common callbacks --------
     def _on_map_ready(self, map_file_path: str):
         self.progress_label.setText("")
         self.progress_bar.setVisible(False)
