@@ -1,32 +1,38 @@
-# visualizer.py
 from __future__ import annotations
 
 import os
 import re
 import time
-from typing import List, Optional, Tuple, Dict, Any
+from typing import Any, Dict, List, Optional, Tuple
 
 import folium
-import osmnx as ox
-import networkx as nx
 import geopandas as gpd
+import networkx as nx
+import numpy as np
+import osmnx as ox
 import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 from folium.plugins import MarkerCluster
-from shapely.geometry import Point, LineString
+from shapely.geometry import Point, Polygon
 from shapely.ops import unary_union
 
-from PyQt5.QtCore import QThread, pyqtSignal, QFile, QIODevice
+from PyQt5.QtCore import QFile, QIODevice, QThread, pyqtSignal
 
-from api import load_city_boundary
+from api import build_accessibility_evaluation, build_accessibility_grid, load_city_boundary
+from accessibility_analyzer import DEFAULT_STATUS_THRESHOLDS
 from config import LEVELS_QUERIES
 from logger_config import logger
 from path_finder import (
     PathfinderError,
-    snap_to_graph,
+    compute_isochrone,
     find_shortest_path,
     find_shortest_path_multi,
     find_shortest_path_via_poi_category,
-    compute_isochrone,
+    snap_to_graph,
 )
 from paths import DIR_OUTPUTS
 from utils import extract_required_tokens
@@ -39,11 +45,10 @@ DEFAULT_CENTER: LatLon = (49.0, 24.0)
 
 MAX_POI_PER_CATEGORY = 6000
 
-# Ізохрони: щоб полігон виглядав нормально навіть у “тонких” графах
-ISO_EDGE_BUFFER_M_MIN = 35.0        # мінімальний буфер навколо reachable-ребер (м)
-ISO_EDGE_BUFFER_M_DEFAULT = 55.0    # стандартний буфер (м)
-ISO_POLY_SIMPLIFY_M = 8.0           # спрощення полігону в метрах
-ISO_MAX_POI_IN_ISO_LAYER = 1200     # обмеження POI для шару “POI в ізохроні”
+ISO_EDGE_BUFFER_M_MIN = 35.0
+ISO_EDGE_BUFFER_M_DEFAULT = 55.0
+ISO_POLY_SIMPLIFY_M = 8.0
+ISO_MAX_POI_IN_ISO_LAYER = 1200
 
 LABEL_MAP = {
     "education": "Освіта",
@@ -52,16 +57,19 @@ LABEL_MAP = {
     "greens_sport": "Зелена інфра / Спорт",
     "shopping_services": "Покупки / Сервіси",
     "transport": "Громадський транспорт",
+    "civic": "Громадські сервіси / Безпека",
+    "food": "Заклади харчування",
+    "work_services": "Робота / Послуги",
+    "tourism": "Туризм / Готелі",
 }
 
-# Маркер, щоб не інжектити JS двічі
 _INJECT_MARKER = "injected: qtwebchannel + map_bridge.js"
 
 
 class MapRenderWorker(QThread):
     progress = pyqtSignal(int)
     status = pyqtSignal(str)
-    finished = pyqtSignal(str)  # map_file_path
+    finished = pyqtSignal(str)
     error = pyqtSignal(str)
 
     def __init__(
@@ -78,11 +86,17 @@ class MapRenderWorker(QThread):
         route_via_category: Optional[str] = None,
         route_stops: Optional[List[LatLon]] = None,
         enable_click_pick: bool = True,
-        # -------- ІЗОХРОНИ --------
         isochrone_center_latlon: Optional[LatLon] = None,
         isochrone_minutes: Optional[List[int]] = None,
         isochrone_walk_speed_kmh: float = 4.8,
         isochrone_buffer_m: float = 0.0,
+        accessibility_center_latlon: Optional[LatLon] = None,
+        accessibility_minutes: int = 15,
+        accessibility_walk_speed_kmh: float = 4.8,
+        accessibility_citywide_enabled: bool = False,
+        accessibility_grid_minutes: Optional[List[int]] = None,
+        accessibility_grid_step_m: float = 320.0,
+        accessibility_grid_max_cells: int = 3200,
     ):
         super().__init__()
         self.G = G
@@ -99,11 +113,18 @@ class MapRenderWorker(QThread):
         self.route_stops = list(route_stops or [])
         self.enable_click_pick = bool(enable_click_pick)
 
-        # -------- ІЗОХРОНИ --------
         self.isochrone_center_latlon = isochrone_center_latlon
         self.isochrone_minutes = list(isochrone_minutes or [])
         self.isochrone_walk_speed_kmh = float(isochrone_walk_speed_kmh)
         self.isochrone_buffer_m = float(isochrone_buffer_m)
+
+        self.accessibility_center_latlon = accessibility_center_latlon
+        self.accessibility_minutes = int(accessibility_minutes or 15)
+        self.accessibility_walk_speed_kmh = float(accessibility_walk_speed_kmh)
+        self.accessibility_citywide_enabled = bool(accessibility_citywide_enabled)
+        self.accessibility_grid_minutes = list(accessibility_grid_minutes or [])
+        self.accessibility_grid_step_m = float(accessibility_grid_step_m)
+        self.accessibility_grid_max_cells = int(accessibility_grid_max_cells)
 
     # -------------------- helpers: geo/poi --------------------
 
@@ -148,6 +169,212 @@ class MapRenderWorker(QThread):
 
         return DEFAULT_CENTER
 
+    def _fit_map_to_city(self, m: folium.Map) -> None:
+        try:
+            b_gdf, _ = load_city_boundary(
+                self.city_name,
+                required_tokens=extract_required_tokens(self.city_name),
+            )
+            if b_gdf is not None and not b_gdf.empty:
+                b_gdf = self._ensure_gdf_crs(b_gdf)
+                minx, miny, maxx, maxy = b_gdf.total_bounds
+                m.fit_bounds([[miny, minx], [maxy, maxx]])
+                return
+        except Exception:
+            pass
+
+        try:
+            if self.gdf_edges is not None and not self.gdf_edges.empty:
+                gdf = self._ensure_gdf_crs(self.gdf_edges)
+                minx, miny, maxx, maxy = gdf.total_bounds
+                m.fit_bounds([[miny, minx], [maxy, maxx]])
+        except Exception:
+            pass
+
+    def _get_city_clip_geom_3857(self):
+        area_gdf = None
+
+        try:
+            b_gdf, _ = load_city_boundary(
+                self.city_name,
+                required_tokens=extract_required_tokens(self.city_name),
+            )
+            if b_gdf is not None and not b_gdf.empty:
+                area_gdf = self._ensure_gdf_crs(b_gdf)
+        except Exception:
+            area_gdf = None
+
+        if area_gdf is not None and not area_gdf.empty:
+            try:
+                clip_geom_3857 = area_gdf.to_crs(3857).geometry.unary_union
+                if clip_geom_3857 is not None and not clip_geom_3857.is_empty:
+                    return area_gdf, clip_geom_3857
+            except Exception:
+                pass
+
+        try:
+            if self.gdf_edges is not None and not self.gdf_edges.empty:
+                edges = self._ensure_gdf_crs(self.gdf_edges).to_crs(3857)
+                hull = edges.geometry.unary_union.convex_hull.buffer(250.0)
+                if hull is not None and not hull.is_empty:
+                    fallback_gdf = gpd.GeoDataFrame(geometry=[hull], crs=3857).to_crs(4326)
+                    return fallback_gdf, hull
+        except Exception:
+            pass
+
+        return None, None
+
+    def _resolve_citywide_grid_params(self, clip_geom_3857):
+        area_m2 = max(float(clip_geom_3857.area), 1.0)
+        minx, miny, maxx, maxy = clip_geom_3857.bounds
+
+        width_m = max(float(maxx - minx), 1.0)
+        height_m = max(float(maxy - miny), 1.0)
+        longest_side_m = max(width_m, height_m)
+
+        wanted_cells = int(min(max(self.accessibility_grid_max_cells, 1800), 6000))
+
+        step_from_area = float(np.sqrt(area_m2 / wanted_cells))
+        step_from_side = float(longest_side_m / 58.0)
+
+        step_m = max(step_from_area, step_from_side)
+        step_m = min(max(step_m, 90.0), 850.0)
+
+        est_cells_bbox = int(np.ceil(width_m / step_m) * np.ceil(height_m / step_m))
+
+        dynamic_max_cells = max(
+            self.accessibility_grid_max_cells,
+            min(9000, int(est_cells_bbox * 1.35) + 200)
+        )
+
+        surface_step_m = min(max(step_m / 2.6, 30.0), 220.0)
+
+        return step_m, dynamic_max_cells, surface_step_m
+
+    def _resolve_growth_cell_size_m(self, clip_geom_3857) -> float:
+        """
+        Розмір дрібної клітинки для "розростання" зон.
+        Чим менше місто — тим дрібніше, чим більше — тим грубіше.
+        """
+        minx, miny, maxx, maxy = clip_geom_3857.bounds
+        width_m = max(float(maxx - minx), 1.0)
+        height_m = max(float(maxy - miny), 1.0)
+        longest_side_m = max(width_m, height_m)
+
+        cell_m = longest_side_m / 140.0
+        cell_m = min(max(cell_m, 35.0), 140.0)
+        return float(cell_m)
+
+    def _assign_status_by_nearest_point(
+        self,
+        clip_geom_3857,
+        xs: np.ndarray,
+        ys: np.ndarray,
+        statuses: List[str],
+        *,
+        cell_size_m: float,
+        chunk_size: int = 2500,
+    ):
+        """
+        Будує дрібну сітку по місту і кожній клітинці дає статус найближчої точки.
+        Це і є "розростання" точок своїм кольором.
+        """
+        minx, miny, maxx, maxy = clip_geom_3857.bounds
+
+        x_edges = np.arange(minx, maxx + cell_size_m, cell_size_m, dtype=float)
+        y_edges = np.arange(miny, maxy + cell_size_m, cell_size_m, dtype=float)
+
+        if len(x_edges) < 2 or len(y_edges) < 2:
+            return []
+
+        centers = []
+        cells = []
+
+        for ix in range(len(x_edges) - 1):
+            x0 = float(x_edges[ix])
+            x1 = float(x_edges[ix + 1])
+
+            for iy in range(len(y_edges) - 1):
+                y0 = float(y_edges[iy])
+                y1 = float(y_edges[iy + 1])
+
+                cell = Polygon([
+                    (x0, y0),
+                    (x1, y0),
+                    (x1, y1),
+                    (x0, y1),
+                ])
+
+                try:
+                    if not clip_geom_3857.intersects(cell):
+                        continue
+
+                    clipped = cell.intersection(clip_geom_3857)
+                    if clipped.is_empty:
+                        continue
+
+                    rp = clipped.representative_point()
+                    centers.append((float(rp.x), float(rp.y)))
+                    cells.append(clipped)
+                except Exception:
+                    continue
+
+        if not centers:
+            return []
+
+        pts = np.column_stack([xs.astype(float), ys.astype(float)])
+        q = np.array(centers, dtype=float)
+
+        nearest_statuses: List[str] = []
+        for i in range(0, len(q), chunk_size):
+            qq = q[i:i + chunk_size]
+
+            dx = qq[:, None, 0] - pts[None, :, 0]
+            dy = qq[:, None, 1] - pts[None, :, 1]
+            dist2 = dx * dx + dy * dy
+
+            nearest_idx = np.argmin(dist2, axis=1)
+            nearest_statuses.extend([statuses[int(j)] for j in nearest_idx])
+
+        out = []
+        for geom, status in zip(cells, nearest_statuses):
+            out.append((geom, status))
+
+        return out
+
+    def _merge_growth_cells_by_status(self, grown_cells):
+        """
+        grown_cells: list[(geom_3857, status_name)]
+        Повертає об'єднані полігони по статусах.
+        """
+        by_status: Dict[str, List[Any]] = {
+            "good": [],
+            "medium": [],
+            "poor": [],
+        }
+
+        for geom, status in grown_cells:
+            if geom is None or getattr(geom, "is_empty", True):
+                continue
+            s = str(status or "poor").strip().lower()
+            if s not in by_status:
+                s = "poor"
+            by_status[s].append(geom)
+
+        merged = []
+        for status_name, geoms in by_status.items():
+            if not geoms:
+                continue
+            try:
+                union_geom = unary_union(geoms)
+                if union_geom is None or getattr(union_geom, "is_empty", True):
+                    continue
+                merged.append((status_name, union_geom))
+            except Exception:
+                continue
+
+        return merged
+
     @staticmethod
     def _subset_for_tags(gdf_all, tags_dict):
         if gdf_all is None or getattr(gdf_all, "empty", True):
@@ -178,10 +405,6 @@ class MapRenderWorker(QThread):
         return gdf_all[mask_total] if mask_total is not None else gdf_all.iloc[0:0]
 
     def _poi_for_current_level(self):
-        """
-        POI тільки з LEVELS_QUERIES[self.level_name], без шуму.
-        Окремо вирізаємо building=house, щоб не засмічувало POI в ізохроні.
-        """
         if self.gdf_all_poi is None or getattr(self.gdf_all_poi, "empty", True):
             return self.gdf_all_poi
 
@@ -246,6 +469,184 @@ class MapRenderWorker(QThread):
         except Exception:
             return None
 
+    # -------------------- color helpers --------------------
+
+    @staticmethod
+    def _hex_to_rgb(color: str) -> Tuple[int, int, int]:
+        color = color.lstrip("#")
+        return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
+
+    @staticmethod
+    def _rgb_to_hex(rgb: Tuple[int, int, int]) -> str:
+        r, g, b = rgb
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    @classmethod
+    def _blend_hex(cls, c1: str, c2: str, t: float) -> str:
+        t = max(0.0, min(1.0, float(t)))
+        r1, g1, b1 = cls._hex_to_rgb(c1)
+        r2, g2, b2 = cls._hex_to_rgb(c2)
+        rgb = (
+            int(round(r1 + (r2 - r1) * t)),
+            int(round(g1 + (g2 - g1) * t)),
+            int(round(b1 + (b2 - b1) * t)),
+        )
+        return cls._rgb_to_hex(rgb)
+
+    def _status_thresholds(self) -> Tuple[float, float]:
+        medium_thr = float(DEFAULT_STATUS_THRESHOLDS.get("medium", 55.0))
+        good_thr = float(DEFAULT_STATUS_THRESHOLDS.get("good", 80.0))
+        if medium_thr >= good_thr:
+            medium_thr, good_thr = 55.0, 80.0
+        return medium_thr, good_thr
+
+    def _score_to_status_name(self, score: float) -> str:
+        medium_thr, good_thr = self._status_thresholds()
+        s = float(score)
+        if s >= good_thr:
+            return "good"
+        if s >= medium_thr:
+            return "medium"
+        return "poor"
+
+    def _status_fill_color(self, status_or_score) -> str:
+        if isinstance(status_or_score, (int, float)):
+            status = self._score_to_status_name(float(status_or_score))
+        else:
+            status = str(status_or_score or "").strip().lower()
+
+        palette = {
+            "good": "#5BAE68",
+            "medium": "#E7C65B",
+            "poor": "#D96B63",
+        }
+        return palette.get(status, "#D96B63")
+
+    def _status_border_color(self, status_or_score) -> str:
+        fill = self._status_fill_color(status_or_score)
+        return self._blend_hex(fill, "#1f2937", 0.38)
+
+    def _score_fill_color(self, score: float) -> str:
+        return self._status_fill_color(score)
+
+    def _score_border_color(self, score: float) -> str:
+        return self._status_border_color(score)
+
+    def _contour_levels(self) -> List[float]:
+        medium_thr, good_thr = self._status_thresholds()
+        return [0.0, medium_thr, good_thr, 100.0]
+
+    def _idw_interpolate_grid(
+        self,
+        xs: np.ndarray,
+        ys: np.ndarray,
+        scores: np.ndarray,
+        grid_x: np.ndarray,
+        grid_y: np.ndarray,
+        *,
+        power: float = 2.0,
+        chunk_size: int = 1800,
+    ) -> np.ndarray:
+        pts = np.column_stack([xs, ys]).astype(float)
+        vals = scores.astype(float)
+
+        query = np.column_stack([grid_x.ravel(), grid_y.ravel()]).astype(float)
+        out = np.empty(len(query), dtype=float)
+
+        for i in range(0, len(query), chunk_size):
+            q = query[i:i + chunk_size]
+
+            dx = q[:, None, 0] - pts[None, :, 0]
+            dy = q[:, None, 1] - pts[None, :, 1]
+            dist2 = dx * dx + dy * dy
+
+            exact_mask = dist2 < 1.0
+            safe_dist2 = np.maximum(dist2, 1.0)
+
+            weights = 1.0 / np.power(safe_dist2, power / 2.0)
+            weighted = (weights * vals[None, :]).sum(axis=1)
+            weights_sum = weights.sum(axis=1)
+
+            pred = weighted / np.maximum(weights_sum, 1e-12)
+
+            if exact_mask.any():
+                rows = np.where(exact_mask.any(axis=1))[0]
+                for r in rows:
+                    c = int(np.argmax(exact_mask[r]))
+                    pred[r] = vals[c]
+
+            out[i:i + chunk_size] = pred
+
+        return out.reshape(grid_x.shape)
+
+    def _build_contour_band_geometries(
+        self,
+        X: np.ndarray,
+        Y: np.ndarray,
+        Z_masked,
+        *,
+        levels: List[float],
+        clip_geom,
+    ) -> List[Tuple[float, float, object]]:
+        fig, ax = plt.subplots(figsize=(6, 6))
+        try:
+            cs = ax.contourf(X, Y, Z_masked, levels=levels, antialiased=True)
+            band_geoms: List[Tuple[float, float, object]] = []
+
+            collections = getattr(cs, "collections", None)
+            if collections is None:
+                return []
+
+            for idx, collection in enumerate(collections):
+                polys = []
+
+                for path in collection.get_paths():
+                    rings = path.to_polygons()
+                    if not rings:
+                        continue
+
+                    outer = rings[0]
+                    if len(outer) < 3:
+                        continue
+
+                    holes = [ring for ring in rings[1:] if len(ring) >= 3]
+
+                    try:
+                        poly = Polygon(outer, holes)
+                    except Exception:
+                        continue
+
+                    if not poly.is_valid:
+                        try:
+                            poly = poly.buffer(0)
+                        except Exception:
+                            continue
+
+                    if poly.is_empty:
+                        continue
+
+                    polys.append(poly)
+
+                if not polys:
+                    continue
+
+                geom = unary_union(polys)
+
+                if clip_geom is not None and not getattr(clip_geom, "is_empty", True):
+                    try:
+                        geom = geom.intersection(clip_geom)
+                    except Exception:
+                        pass
+
+                if geom.is_empty:
+                    continue
+
+                band_geoms.append((float(levels[idx]), float(levels[idx + 1]), geom))
+
+            return band_geoms
+        finally:
+            plt.close(fig)
+
     # -------------------- helpers: folium layers --------------------
 
     def _add_streets_layer(self, m: folium.Map, *, show: bool) -> None:
@@ -258,7 +659,11 @@ class MapRenderWorker(QThread):
                 data=gdf[["geometry"]].to_json(),
                 name="Вулиці",
                 show=bool(show),
-                style_function=lambda _: {"color": "#4a4a4a", "weight": 2, "opacity": 0.55},
+                style_function=lambda _: {
+                    "color": "#4b5563",
+                    "weight": 1.6,
+                    "opacity": 0.30,
+                },
             ).add_to(m)
         except Exception as e:
             logger.warning("Не вдалося додати шар 'Вулиці': %s", e)
@@ -287,7 +692,13 @@ class MapRenderWorker(QThread):
                 data=b_gdf[["geometry"]].to_json(),
                 name="Кордон міста",
                 show=True,
-                style_function=lambda _: {"color": "#d9534f", "weight": 3, "fill": False, "opacity": 0.9},
+                style_function=lambda _: {
+                    "color": "#b45353",
+                    "weight": 2.2,
+                    "fill": False,
+                    "opacity": 0.78,
+                    "dashArray": "5,6",
+                },
             ).add_to(m)
         except Exception as e:
             logger.warning("Boundary: не вдалося отримати/намалювати для '%s': %s", self.city_name, e)
@@ -312,7 +723,6 @@ class MapRenderWorker(QThread):
         fg = folium.FeatureGroup(name="Маршрут", show=True)
         fg.add_to(m)
 
-        # 1) SNAP debug (start/end)
         try:
             Gwork = self.G.to_undirected()
 
@@ -373,7 +783,7 @@ class MapRenderWorker(QThread):
             folium.PolyLine(
                 locations=[snap_s.input_latlon, snap_s.snapped_latlon],
                 weight=2,
-                opacity=0.85,
+                opacity=0.75,
                 dash_array="6,6",
                 tooltip="Старт: клік → дорога",
             ).add_to(fg)
@@ -381,7 +791,7 @@ class MapRenderWorker(QThread):
             folium.PolyLine(
                 locations=[snap_e.input_latlon, snap_e.snapped_latlon],
                 weight=2,
-                opacity=0.85,
+                opacity=0.75,
                 dash_array="6,6",
                 tooltip="Фініш: клік → дорога",
             ).add_to(fg)
@@ -391,7 +801,6 @@ class MapRenderWorker(QThread):
             folium.Marker(location=list(self.route_start_latlon), tooltip="Старт").add_to(fg)
             folium.Marker(location=list(self.route_end_latlon), tooltip="Фініш").add_to(fg)
 
-        # Stop markers
         if self.route_stops:
             for i, st in enumerate(self.route_stops, start=1):
                 folium.Marker(
@@ -424,7 +833,7 @@ class MapRenderWorker(QThread):
                 mp = find_shortest_path_multi(
                     self.G,
                     points=points,
-                    algorithm=self.route_algorithm,  # type: ignore
+                    algorithm=self.route_algorithm,
                     weight="length",
                     use_undirected=True,
                     snap_mode="edge",
@@ -434,7 +843,6 @@ class MapRenderWorker(QThread):
                 self.status.emit(f"Маршрут multi-stop: сегментів={len(mp.segments)}, довжина~{result_len_m:.0f} м")
             else:
                 if via and via.lower() != "none":
-                    # Ліміт: +10 хв від найкоротшого (у метрах через walking speed)
                     detour_minutes = 10.0
                     speed_kmh = float(self.isochrone_walk_speed_kmh or 4.8)
                     detour_limit_m = detour_minutes * (speed_kmh * 1000.0 / 60.0)
@@ -446,7 +854,7 @@ class MapRenderWorker(QThread):
                             self.route_start_latlon,
                             self.route_end_latlon,
                             via_category=via,
-                            algorithm=self.route_algorithm,  # type: ignore
+                            algorithm=self.route_algorithm,
                             weight="length",
                             use_undirected=True,
                             snap_mode="edge",
@@ -473,12 +881,11 @@ class MapRenderWorker(QThread):
                         result_len_m = float(r.length_m)
 
                     except PathfinderError as e:
-                        # Fallback: показуємо найкоротший маршрут + “людське” пояснення
                         r0 = find_shortest_path(
                             self.G,
                             self.route_start_latlon,
                             self.route_end_latlon,
-                            algorithm=self.route_algorithm,  # type: ignore
+                            algorithm=self.route_algorithm,
                             weight="length",
                             use_undirected=True,
                             snap_mode="edge",
@@ -516,7 +923,7 @@ class MapRenderWorker(QThread):
                         self.G,
                         self.route_start_latlon,
                         self.route_end_latlon,
-                        algorithm=self.route_algorithm,  # type: ignore
+                        algorithm=self.route_algorithm,
                         weight="length",
                         use_undirected=True,
                         snap_mode="edge",
@@ -541,6 +948,455 @@ class MapRenderWorker(QThread):
             logger.exception("Маршрут: помилка: %s", e)
             self.status.emit(f"Маршрут: помилка — {e}")
 
+    # -------------------- Оцінка доступності --------------------
+
+    @staticmethod
+    def _accessibility_status_label(status: str) -> str:
+        status_norm = (status or "").strip().lower()
+        if status_norm == "good":
+            return "Добра"
+        if status_norm == "medium":
+            return "Середня"
+        return "Слабка"
+
+    def _group_label(self, name: str) -> str:
+        return LABEL_MAP.get(name, str(name).replace("_", " ").strip().title())
+
+    def _add_accessibility_layer(self, m: folium.Map) -> None:
+        if not self.accessibility_center_latlon:
+            return
+
+        center = self.accessibility_center_latlon
+        minutes = max(1, int(self.accessibility_minutes or 15))
+
+        fg = folium.FeatureGroup(name=f"Оцінка доступності ({minutes} хв)", show=True)
+        fg.add_to(m)
+
+        try:
+            self.status.emit(
+                f"Оцінка доступності: аналізую точку {self._fmt_ll(center)} | "
+                f"{minutes} хв | рівень={self.level_name}"
+            )
+
+            result = build_accessibility_evaluation(
+                self.G,
+                self.gdf_all_poi,
+                center=center,
+                level=self.level_name,
+                minutes=float(minutes),
+                walk_speed_kmh=float(self.accessibility_walk_speed_kmh),
+                weight="length",
+            )
+
+            fill_color = self._status_fill_color(result.status)
+            border_color = self._status_border_color(result.status)
+            status_label = self._accessibility_status_label(result.status)
+
+            try:
+                snap = snap_to_graph(self.G.to_undirected(), center, mode="edge")
+                snapped = snap.snapped_latlon
+            except Exception:
+                snapped = center
+
+            covered_labels = [self._group_label(g.group_name) for g in result.group_results if g.present]
+            missing_labels = [self._group_label(x) for x in result.missing_groups]
+
+            covered_html = ", ".join(covered_labels) if covered_labels else "—"
+            missing_html = ", ".join(missing_labels) if missing_labels else "—"
+
+            popup_html = (
+                f"<div style='min-width:280px'>"
+                f"<h4 style='margin:0 0 8px 0;'>Оцінка 15-хв доступності</h4>"
+                f"<b>Рівень:</b> {self.level_name}<br>"
+                f"<b>Час:</b> {result.minutes:.0f} хв<br>"
+                f"<b>Статус:</b> {status_label}<br>"
+                f"<b>Score:</b> {result.score_100:.1f} / 100<br>"
+                f"<b>Покрито груп:</b> {result.covered_groups} / {result.total_groups}<br>"
+                f"<b>POI всередині ізохрони:</b> {result.inside_poi_count}<br><br>"
+                f"<b>Є доступ:</b> {covered_html}<br><br>"
+                f"<b>Бракує:</b> {missing_html}"
+                f"</div>"
+            )
+
+            folium.Marker(
+                location=[center[0], center[1]],
+                tooltip=f"Оцінка доступності: {result.score_100:.1f}/100",
+                popup=folium.Popup(popup_html, max_width=420),
+                icon=folium.Icon(icon="info-sign"),
+            ).add_to(fg)
+
+            if snapped != center:
+                folium.CircleMarker(
+                    location=[snapped[0], snapped[1]],
+                    radius=5,
+                    weight=2,
+                    color=border_color,
+                    fill=True,
+                    fill_color=fill_color,
+                    fill_opacity=0.95,
+                    tooltip="Центр аналізу (на дорозі)",
+                    popup=(
+                        f"<b>Snapped центр</b>: {self._fmt_ll(snapped)}<br>"
+                        f"Вихідна точка: {self._fmt_ll(center)}"
+                    ),
+                ).add_to(fg)
+
+            poly = result.isochrone.polygon
+            if poly is not None:
+                geojson = {
+                    "type": "FeatureCollection",
+                    "features": [
+                        {
+                            "type": "Feature",
+                            "properties": {
+                                "minutes": float(result.minutes),
+                                "score_100": float(result.score_100),
+                                "status": str(result.status),
+                            },
+                            "geometry": poly.__geo_interface__,
+                        }
+                    ],
+                }
+
+                folium.GeoJson(
+                    data=geojson,
+                    show=True,
+                    style_function=lambda _feat, fc=fill_color, bc=border_color: {
+                        "color": bc,
+                        "weight": 2.2,
+                        "fill": True,
+                        "fillColor": fc,
+                        "fillOpacity": 0.24,
+                        "opacity": 0.82,
+                    },
+                    highlight_function=lambda _feat: {
+                        "color": "#1f2937",
+                        "weight": 3.0,
+                        "fillOpacity": 0.30,
+                        "opacity": 0.95,
+                    },
+                    tooltip=(
+                        f"{status_label}: {result.score_100:.1f}/100 | "
+                        f"покрито {result.covered_groups}/{result.total_groups}"
+                    ),
+                ).add_to(fg)
+
+            self.status.emit(
+                f"Оцінка доступності: {status_label.lower()} | "
+                f"score {result.score_100:.1f}/100 | "
+                f"покрито {result.covered_groups}/{result.total_groups}"
+            )
+
+        except Exception as e:
+            logger.exception("Accessibility layer failed: %s", e)
+            self.status.emit(f"Оцінка доступності: помилка — {e}")
+
+    def _add_accessibility_legend(self, m: folium.Map) -> None:
+        medium_thr, good_thr = self._status_thresholds()
+
+        poor_color = self._status_fill_color("poor")
+        medium_color = self._status_fill_color("medium")
+        good_color = self._status_fill_color("good")
+
+        html = f"""
+        <div style="
+            position: fixed;
+            bottom: 18px;
+            left: 18px;
+            z-index: 9999;
+            background: rgba(255,255,255,0.95);
+            border: 1px solid rgba(0,0,0,0.14);
+            border-radius: 12px;
+            padding: 12px 14px;
+            font-size: 13px;
+            min-width: 230px;
+            box-shadow: 0 6px 18px rgba(0,0,0,0.14);
+            backdrop-filter: blur(4px);
+        ">
+          <div style="font-weight:700; margin-bottom:8px;">Карта доступності</div>
+
+          <div style="display:flex; align-items:center; margin-bottom:6px;">
+            <span style="display:inline-block;width:12px;height:12px;background:{good_color};border-radius:50%;margin-right:8px;"></span>
+            <span>добра доступність (≥ {good_thr:.0f})</span>
+          </div>
+
+          <div style="display:flex; align-items:center; margin-bottom:6px;">
+            <span style="display:inline-block;width:12px;height:12px;background:{medium_color};border-radius:50%;margin-right:8px;"></span>
+            <span>середня доступність ({medium_thr:.0f}–{good_thr:.0f})</span>
+          </div>
+
+          <div style="display:flex; align-items:center;">
+            <span style="display:inline-block;width:12px;height:12px;background:{poor_color};border-radius:50%;margin-right:8px;"></span>
+            <span>слабка доступність (&lt; {medium_thr:.0f})</span>
+          </div>
+        </div>
+        """
+        try:
+            m.get_root().html.add_child(folium.Element(html))
+        except Exception:
+            pass
+
+    def _add_accessibility_summary_badge(
+        self,
+        m: folium.Map,
+        *,
+        minutes: int,
+        mean_score: Optional[float],
+        cells_ok: int,
+        cells_total: int,
+    ) -> None:
+        mean_text = f"{mean_score:.1f}" if mean_score is not None else "—"
+        html = f"""
+        <div style="
+            position: fixed;
+            top: 18px;
+            left: 70px;
+            z-index: 9999;
+            background: rgba(255,255,255,0.94);
+            border: 1px solid rgba(0,0,0,0.12);
+            border-radius: 12px;
+            padding: 10px 12px;
+            font-size: 13px;
+            box-shadow: 0 6px 18px rgba(0,0,0,0.14);
+            backdrop-filter: blur(4px);
+        ">
+          <div style="font-weight:700; margin-bottom:4px;">{minutes} хв • {self.level_name}</div>
+          <div>Середній score: <b>{mean_text}</b></div>
+          <div>Точок аналізу: <b>{cells_ok}/{cells_total}</b></div>
+        </div>
+        """
+        try:
+            m.get_root().html.add_child(folium.Element(html))
+        except Exception:
+            pass
+
+    def _add_accessibility_citywide_layers(self, m: folium.Map) -> None:
+        if not self.accessibility_citywide_enabled:
+            return
+
+        minutes_list = sorted({int(x) for x in self.accessibility_grid_minutes if int(x) > 0})
+        if not minutes_list:
+            minutes_list = [15]
+
+        area_gdf, clip_geom_3857 = self._get_city_clip_geom_3857()
+        if clip_geom_3857 is None or getattr(clip_geom_3857, "is_empty", True):
+            self.status.emit("Карта доступності міста: не вдалося отримати геометрію міста.")
+            return
+
+        dynamic_step_m, dynamic_max_cells, _surface_step_m = self._resolve_citywide_grid_params(clip_geom_3857)
+        growth_cell_m = self._resolve_growth_cell_size_m(clip_geom_3857)
+
+        self._add_accessibility_legend(m)
+
+        for idx, minutes in enumerate(minutes_list, start=1):
+            self.status.emit(
+                f"Карта доступності міста: {minutes} хв | рівень={self.level_name} | "
+                f"точки={dynamic_step_m:.0f} м | ріст зон={growth_cell_m:.0f} м"
+            )
+
+            try:
+                result = build_accessibility_grid(
+                    self.G,
+                    self.gdf_all_poi,
+                    level=self.level_name,
+                    minutes=float(minutes),
+                    walk_speed_kmh=float(self.accessibility_walk_speed_kmh),
+                    step_m=float(dynamic_step_m),
+                    max_cells=int(dynamic_max_cells),
+                    area_geometry=area_gdf,
+                    weight="length",
+                )
+            except Exception as e:
+                logger.exception("Citywide accessibility grid failed (%s хв): %s", minutes, e)
+                self.status.emit(f"Карта доступності міста {minutes} хв: помилка — {e}")
+                continue
+
+            samples: List[Tuple[float, float, Any]] = []
+            for cell in result.cells:
+                p = self._geom_to_point(cell.geometry)
+                if p is None:
+                    continue
+                samples.append((float(p.y), float(p.x), cell))
+
+            if len(samples) < 3:
+                self.status.emit(f"Карта доступності міста {minutes} хв: замало точок аналізу.")
+                continue
+
+            pts_gdf = gpd.GeoDataFrame(
+                {
+                    "status_name": [
+                        str(cell.status or self._score_to_status_name(cell.score_100)).strip().lower()
+                        for _, _, cell in samples
+                    ],
+                    "score": [float(cell.score_100) for _, _, cell in samples],
+                    "covered_text": [f"{cell.covered_groups}/{cell.total_groups}" for _, _, cell in samples],
+                    "inside_poi_count": [int(cell.inside_poi_count) for _, _, cell in samples],
+                    "missing_text": [
+                        ", ".join(self._group_label(x) for x in cell.missing_groups) if cell.missing_groups else "—"
+                        for _, _, cell in samples
+                    ],
+                },
+                geometry=[Point(lon, lat) for lat, lon, _ in samples],
+                crs=4326,
+            ).to_crs(3857)
+
+            xs = pts_gdf.geometry.x.to_numpy(dtype=float)
+            ys = pts_gdf.geometry.y.to_numpy(dtype=float)
+            statuses = pts_gdf["status_name"].astype(str).tolist()
+
+            grown_cells = self._assign_status_by_nearest_point(
+                clip_geom_3857,
+                xs,
+                ys,
+                statuses,
+                cell_size_m=float(growth_cell_m),
+                chunk_size=2500,
+            )
+
+            if not grown_cells:
+                self.status.emit(f"Карта доступності міста {minutes} хв: не вдалося виростити зони.")
+                continue
+
+            merged_zones = self._merge_growth_cells_by_status(grown_cells)
+            if not merged_zones:
+                self.status.emit(f"Карта доступності міста {minutes} хв: не вдалося об'єднати зони.")
+                continue
+
+            smooth_layer_name = f"Карта доступності {minutes} хв [{self.level_name}]"
+            smooth_fg = folium.FeatureGroup(name=smooth_layer_name, show=(idx == len(minutes_list)))
+            smooth_fg.add_to(m)
+
+            features = []
+            for status_name, geom_3857 in merged_zones:
+                try:
+                    geom_4326 = gpd.GeoSeries([geom_3857], crs=3857).to_crs(4326).iloc[0]
+                except Exception:
+                    continue
+
+                if geom_4326.is_empty:
+                    continue
+
+                features.append(
+                    {
+                        "type": "Feature",
+                        "properties": {
+                            "status_name": status_name,
+                            "status_label": self._accessibility_status_label(status_name),
+                            "fill_color": self._status_fill_color(status_name),
+                            "border_color": self._status_border_color(status_name),
+                        },
+                        "geometry": geom_4326.__geo_interface__,
+                    }
+                )
+
+            if features:
+                geojson = {
+                    "type": "FeatureCollection",
+                    "features": features,
+                }
+
+                folium.GeoJson(
+                    data=geojson,
+                    show=True,
+                    style_function=lambda feat: {
+                        "color": feat["properties"]["border_color"],
+                        "weight": 1.25,
+                        "fill": True,
+                        "fillColor": feat["properties"]["fill_color"],
+                        "fillOpacity": 0.30,
+                        "opacity": 0.72,
+                    },
+                    highlight_function=lambda feat: {
+                        "color": "#1f2937",
+                        "weight": 1.9,
+                        "fillColor": feat["properties"]["fill_color"],
+                        "fillOpacity": 0.42,
+                        "opacity": 0.92,
+                    },
+                    tooltip=folium.GeoJsonTooltip(
+                        fields=["status_label"],
+                        aliases=["Статус:"],
+                        labels=True,
+                        sticky=True,
+                    ),
+                ).add_to(smooth_fg)
+
+            detail_layer_name = f"Детальні точки {minutes} хв [{self.level_name}]"
+            detail_fg = folium.FeatureGroup(name=detail_layer_name, show=False)
+            detail_fg.add_to(m)
+
+            detail_limit = 1200
+            step = max(1, len(samples) // detail_limit)
+
+            for i, (lat, lon, cell) in enumerate(samples):
+                if i % step != 0:
+                    continue
+
+                status_name = str(cell.status or self._score_to_status_name(cell.score_100)).strip().lower()
+                fill_color = self._status_fill_color(status_name)
+                border_color = self._status_border_color(status_name)
+                status_label = self._accessibility_status_label(status_name)
+                missing_text = ", ".join(
+                    self._group_label(x) for x in cell.missing_groups) if cell.missing_groups else "—"
+
+                popup_html = (
+                    f"<div style='min-width:260px'>"
+                    f"<b>{minutes} хв • {self.level_name}</b><br>"
+                    f"<b>Статус:</b> {status_label}<br>"
+                    f"<b>Score:</b> {cell.score_100:.1f}/100<br>"
+                    f"<b>Покрито груп:</b> {cell.covered_groups}/{cell.total_groups}<br>"
+                    f"<b>POI всередині:</b> {cell.inside_poi_count}<br>"
+                    f"<b>Бракує:</b> {missing_text}"
+                    f"</div>"
+                )
+
+                folium.CircleMarker(
+                    location=[lat, lon],
+                    radius=2.4,
+                    color=border_color,
+                    weight=0.8,
+                    fill=True,
+                    fill_color=fill_color,
+                    fill_opacity=0.72,
+                    opacity=0.75,
+                    tooltip=f"Score: {cell.score_100:.1f}",
+                    popup=folium.Popup(popup_html, max_width=380),
+                ).add_to(detail_fg)
+
+            if idx == len(minutes_list):
+                self._add_accessibility_summary_badge(
+                    m,
+                    minutes=minutes,
+                    mean_score=result.score_mean,
+                    cells_ok=result.successful_cells,
+                    cells_total=result.total_cells,
+                )
+
+            clipped_note = ""
+            if result.total_cells >= int(dynamic_max_cells):
+                clipped_note = " | авто-ліміт досягнуто"
+
+            if result.score_mean is not None:
+                self.status.emit(
+                    f"Карта доступності {minutes} хв: точок {result.successful_cells}/{result.total_cells}, "
+                    f"mean score = {result.score_mean:.1f}{clipped_note}"
+                )
+            else:
+                self.status.emit(
+                    f"Карта доступності {minutes} хв: точок {result.successful_cells}/{result.total_cells}{clipped_note}"
+                )
+
+            logger.info(
+                "Citywide accessibility rendered (grown status zones): minutes=%s level=%s cells=%d/%d mean=%s point_step=%.1f grow_step=%.1f",
+                minutes,
+                self.level_name,
+                result.successful_cells,
+                result.total_cells,
+                f"{result.score_mean:.1f}" if result.score_mean is not None else "—",
+                dynamic_step_m,
+                growth_cell_m,
+            )
+
     # -------------------- Ізохрони --------------------
 
     @staticmethod
@@ -557,11 +1413,11 @@ class MapRenderWorker(QThread):
         return "#756bb1"
 
     def _reachable_subgraph_and_edges(
-            self,
-            center: LatLon,
-            cutoff_m: float,
-            *,
-            use_undirected: bool = True,
+        self,
+        center: LatLon,
+        cutoff_m: float,
+        *,
+        use_undirected: bool = True,
     ):
         Gwork = self.G.to_undirected() if use_undirected else self.G
 
@@ -638,7 +1494,7 @@ class MapRenderWorker(QThread):
             except Exception:
                 pass
 
-            poly_wgs = gpd.GeoSeries([poly], crs=3857).to_crs(epsg=4326).iloc[0]
+            poly_wgs = gpd.GeoSeries([poly], crs=3857).to_crs(4326).iloc[0]
             return poly_wgs
         except Exception as e:
             logger.warning("Iso polygon from edges failed: %s", e)
@@ -736,15 +1592,14 @@ class MapRenderWorker(QThread):
 
                 folium.GeoJson(
                     data=geojson,
-                    name=f"Ізохрона {minutes} хв (полігон)",
                     show=True,
                     style_function=lambda _feat, c=color: {
                         "color": c,
                         "weight": 3,
                         "fill": True,
                         "fillColor": c,
-                        "fillOpacity": 0.22,
-                        "opacity": 0.95,
+                        "fillOpacity": 0.18,
+                        "opacity": 0.82,
                     },
                     tooltip=f"Ізохрона {minutes} хв",
                 ).add_to(fg)
@@ -757,12 +1612,11 @@ class MapRenderWorker(QThread):
 
                     folium.GeoJson(
                         data=gdf_draw[["geometry"]].to_json(),
-                        name=f"Ізохрона {minutes} хв — дороги",
                         show=True,
                         style_function=lambda _feat, c=color: {
                             "color": c,
-                            "weight": 2,
-                            "opacity": 0.85,
+                            "weight": 1.8,
+                            "opacity": 0.70,
                         },
                     ).add_to(fg)
                     self.status.emit(f"Ізохрона {minutes} хв: ребер у підграфі = {len(gdf_edges_iso)}")
@@ -986,20 +1840,28 @@ class MapRenderWorker(QThread):
             self.progress.emit(20)
 
             self._add_route_layer(m)
-            self.progress.emit(35)
+            self.progress.emit(24)
 
-            self._add_isochrone_layers(m)
+            self._add_accessibility_citywide_layers(m)
+            self.progress.emit(40)
+
+            self._add_accessibility_layer(m)
             self.progress.emit(50)
 
+            self._add_isochrone_layers(m)
+            self.progress.emit(62)
+
             self._add_streets_layer(m, show=False)
-            self.progress.emit(65)
+            self.progress.emit(72)
 
             self._add_boundary_layer(m)
-            self.progress.emit(75)
+            self.progress.emit(80)
 
             self.status.emit("POI: рендер…")
             self._add_poi_layers(m)
             self.progress.emit(92)
+
+            self._fit_map_to_city(m)
 
             folium.LayerControl(collapsed=False).add_to(m)
 

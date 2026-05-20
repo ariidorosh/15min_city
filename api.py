@@ -1,4 +1,3 @@
-# api.py
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -9,15 +8,21 @@ import networkx as nx
 from graph_builder import get_city_graph_with_source
 from poi_extractor import get_poi_with_source, load_boundary_from_cache_debug
 from path_finder import (
+    MultiPathResult,
+    PathResult,
+    ViaStopSelection,
     compute_isochrone,
     find_shortest_path,
     find_shortest_path_multi,
     find_shortest_path_via_poi_category,
-    MultiPathResult,
-    PathResult,
-    ViaStopSelection,
 )
 from app_types import Algorithm, LatLon, SourceInfo
+from accessibility_analyzer import (
+    AccessibilityEvaluation,
+    AccessibilityGridResult,
+    evaluate_accessibility,
+    evaluate_accessibility_grid,
+)
 
 
 # ============================================================
@@ -159,6 +164,57 @@ def build_isochrone(
         G,
         center_latlon=center,
         cutoff=cutoff,
+        weight=weight,
+    )
+
+
+# ============================================================
+# Accessibility evaluation
+# ============================================================
+def build_accessibility_evaluation(
+    G: nx.MultiDiGraph,
+    gdf_all_poi: gpd.GeoDataFrame,
+    *,
+    center: LatLon,
+    level: str = "medium",
+    minutes: float = 15.0,
+    walk_speed_kmh: float = 4.8,
+    weight: str = "length",
+) -> AccessibilityEvaluation:
+    """Повертає оцінку 15-хвилинної доступності для вибраної точки."""
+    return evaluate_accessibility(
+        G,
+        gdf_all_poi,
+        center=center,
+        level=level,
+        minutes=minutes,
+        walk_speed_kmh=walk_speed_kmh,
+        weight=weight,
+    )
+
+
+def build_accessibility_grid(
+    G: nx.MultiDiGraph,
+    gdf_all_poi: gpd.GeoDataFrame,
+    *,
+    level: str = "medium",
+    minutes: float = 15.0,
+    walk_speed_kmh: float = 4.8,
+    step_m: float = 600.0,
+    max_cells: int = 160,
+    area_geometry=None,
+    weight: str = "length",
+) -> AccessibilityGridResult:
+    """Повертає міську карту доступності у вигляді сітки клітинок."""
+    return evaluate_accessibility_grid(
+        G,
+        gdf_all_poi,
+        level=level,
+        minutes=minutes,
+        walk_speed_kmh=walk_speed_kmh,
+        step_m=step_m,
+        max_cells=max_cells,
+        area_geometry=area_geometry,
         weight=weight,
     )
 

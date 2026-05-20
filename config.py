@@ -217,6 +217,7 @@ DELTA_MAXIMUM: LevelSpec = {
 
 
 # Хелпери мерджу/DIFF/валідації
+# Хелпери мерджу/DIFF/валідації
 def _union_preserve_order(base: List[str], add: List[str]) -> List[str]:
     seen = set(base)
     out = list(base)
@@ -227,18 +228,51 @@ def _union_preserve_order(base: List[str], add: List[str]) -> List[str]:
     return out
 
 
-def deep_merge_levels(base: Mapping[str, Mapping[str, List[str]]],
-                      delta: Mapping[str, Mapping[str, List[str]]]
-                      ) -> Dict[str, Dict[str, List[str]]]:
-    merged: Dict[str, Dict[str, List[str]]] = {cat: {k: list(v) for k, v in sub.items()}
-                                               for cat, sub in base.items()}
+def _copy_group_spec(spec: GroupSpec) -> GroupSpec:
+    out: GroupSpec = {}
+    for key, value in spec.items():
+        if key == "__fallback__":
+            fb_out: FallbackBlock = {}
+            if isinstance(value, dict):
+                for fb_key, fb_tags in value.items():
+                    fb_out[str(fb_key)] = list(fb_tags)
+            out[key] = fb_out
+        else:
+            out[key] = list(value) if isinstance(value, list) else []
+    return out
+
+
+def deep_merge_levels(base: Mapping[str, GroupSpec],
+                      delta: Mapping[str, GroupSpec]
+                      ) -> Dict[str, GroupSpec]:
+    merged: Dict[str, GroupSpec] = {cat: _copy_group_spec(sub) for cat, sub in base.items()}
+
     for cat, sub in delta.items():
         if cat not in merged:
-            merged[cat] = {}
+            merged[cat] = _copy_group_spec(sub)
+            continue
+
         for osm_key, tags in sub.items():
-            if osm_key not in merged[cat]:
-                merged[cat][osm_key] = []
-            merged[cat][osm_key] = _union_preserve_order(merged[cat][osm_key], list(tags))
+            if osm_key == "__fallback__":
+                current_fb = merged[cat].get("__fallback__")
+                if not isinstance(current_fb, dict):
+                    current_fb = {}
+                new_fb = tags if isinstance(tags, dict) else {}
+
+                fb_merged: FallbackBlock = {str(k): list(v) for k, v in current_fb.items()}
+                for fb_key, fb_tags in new_fb.items():
+                    existing = fb_merged.get(str(fb_key), [])
+                    fb_merged[str(fb_key)] = _union_preserve_order(existing, list(fb_tags))
+
+                merged[cat]["__fallback__"] = fb_merged
+                continue
+
+            existing_tags = merged[cat].get(osm_key, [])
+            if not isinstance(existing_tags, list):
+                existing_tags = []
+            add_tags = list(tags) if isinstance(tags, list) else []
+            merged[cat][osm_key] = _union_preserve_order(existing_tags, add_tags)
+
     return merged
 
 

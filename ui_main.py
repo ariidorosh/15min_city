@@ -1,4 +1,3 @@
-# ui_main.py
 import os
 import json
 
@@ -416,9 +415,9 @@ class MainWindow(QMainWindow):
         self.btn_route.clicked.connect(self.build_route_only)
 
         # ============================================================
-        # 5.1) Ізохрони (НОВЕ)
+        # 5.1) Ізохрони
         # ============================================================
-        self.left_layout.addWidget(QLabel("Ізохрони (від точки старту):"))
+        self.left_layout.addWidget(QLabel("Ізохрони / карта доступності:"))
 
         self.iso_select = QComboBox()
         self.iso_select.addItems(["5 хв", "10 хв", "15 хв", "5/10/15"])
@@ -430,6 +429,12 @@ class MainWindow(QMainWindow):
         self.btn_isochrone.setMinimumHeight(40)
         self.left_layout.addWidget(self.btn_isochrone)
         self.btn_isochrone.clicked.connect(self.build_isochrone_only)
+
+        self.btn_accessibility = QPushButton("Карта доступності міста")
+        self.btn_accessibility.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.btn_accessibility.setMinimumHeight(40)
+        self.left_layout.addWidget(self.btn_accessibility)
+        self.btn_accessibility.clicked.connect(self.build_accessibility_only)
 
         # ============================================================
         # Прогрес / статус
@@ -504,6 +509,7 @@ class MainWindow(QMainWindow):
         self.btn_clear_cache.setEnabled(not busy)
         self.btn_route.setEnabled(not busy)
         self.btn_isochrone.setEnabled(not busy)
+        self.btn_accessibility.setEnabled(not busy)
 
         self.progress_bar.setVisible(show_progress and busy)
         if busy:
@@ -1005,6 +1011,91 @@ class MainWindow(QMainWindow):
             isochrone_minutes=minutes_list,
             isochrone_walk_speed_kmh=4.8,
             isochrone_buffer_m=0.0,
+        )
+
+        mworker.status.connect(self._set_status)
+        mworker.progress.connect(self.progress_bar.setValue)
+        mworker.finished.connect(self._on_map_ready)
+        mworker.error.connect(self._on_build_error)
+
+        mworker.finished.connect(lambda *_: self._cleanup_thread(mworker))
+        mworker.error.connect(lambda *_: self._cleanup_thread(mworker))
+
+        self._threads.append(mworker)
+        mworker.start()
+
+    def build_accessibility_only(self):
+        if (
+            self._last_G is None or self._last_gdf_edges is None
+            or self._last_city is None or self._last_safe_city is None
+        ):
+            QMessageBox.information(
+                self,
+                "Карта доступності міста",
+                "Спочатку побудуй карту для міста (кнопка 'Побудувати карту')."
+            )
+            return
+        if self._last_gdf_all_poi is None:
+            QMessageBox.information(
+                self,
+                "Карта доступності міста",
+                "POI ще не завантажились. Спробуй ще раз через пару секунд."
+            )
+            return
+
+        level = self._current_level()
+        minutes_list = self._parse_iso_minutes()
+
+        # Якщо вибрано 5/10/15 — робимо грубшу сітку, щоб не вмерти по часу
+        if len(minutes_list) > 1:
+            grid_step_m = 750.0
+            grid_max_cells = 110
+        else:
+            grid_step_m = 600.0
+            grid_max_cells = 160
+
+        logger.info(
+            "UI: build citywide accessibility requested | minutes=%s | level=%s | step=%.0f | max_cells=%d",
+            minutes_list, level, grid_step_m, grid_max_cells
+        )
+
+        self._set_status(
+            f"Карта доступності міста: хв={minutes_list} | рівень={level} | "
+            f"сітка={grid_step_m:.0f} м | max_cells={grid_max_cells}"
+        )
+
+        self._set_busy(True)
+
+        mworker = MapRenderWorker(
+            self._last_G,
+            self._last_gdf_edges,
+            self._last_gdf_all_poi,
+            self._last_safe_city,
+            self._last_city,
+            level,
+
+            route_start_latlon=None,
+            route_end_latlon=None,
+            route_algorithm="dijkstra",
+            route_via_category="none",
+            route_stops=[],
+
+            enable_click_pick=WEBCHANNEL_AVAILABLE,
+
+            # локальна точка-оцінка не потрібна
+            isochrone_center_latlon=None,
+            isochrone_minutes=[],
+            isochrone_walk_speed_kmh=4.8,
+            isochrone_buffer_m=0.0,
+
+            accessibility_center_latlon=None,
+            accessibility_minutes=15,
+            accessibility_walk_speed_kmh=4.8,
+
+            accessibility_citywide_enabled=True,
+            accessibility_grid_minutes=minutes_list,
+            accessibility_grid_step_m=grid_step_m,
+            accessibility_grid_max_cells=grid_max_cells,
         )
 
         mworker.status.connect(self._set_status)
